@@ -1,4 +1,4 @@
-// TempoSkip Content Script (v1.2.3)
+// TempoSkip Content Script (v1.3.0)
 // Runs at document_start across all frames to override playback speeds and Left/Right arrow skip durations.
 // Precision MSE seek engine: zero buffer snapping, serialized in-flight seeks, and pause-seek-play stall recovery.
 
@@ -415,6 +415,28 @@
     performRawSeekWithRecovery(media, exactTarget);
   }
 
+  // --- MAIN-world bridge client (see bridge.js) ---
+  let bridgeReqId = 0;
+  function bridgeSeek(t) {
+    return new Promise((resolve) => {
+      const id = ++bridgeReqId;
+      const onRes = (ev) => {
+        let r;
+        try { r = JSON.parse(ev.detail); } catch (_) { return; }
+        if (!r || r.id !== id) return;
+        document.removeEventListener("temposkip:res", onRes);
+        clearTimeout(to);
+        resolve(r);
+      };
+      const to = setTimeout(() => {
+        document.removeEventListener("temposkip:res", onRes);
+        resolve({ ok: false, reason: "bridge timeout" });
+      }, 400);
+      document.addEventListener("temposkip:res", onRes);
+      document.dispatchEvent(new CustomEvent("temposkip:req", { detail: JSON.stringify({ id, op: "seek", t }) }));
+    });
+  }
+
   // --- Player-native seek assist ---
   // Crunchyroll's engine only re-targets its segment loader when the seek goes through ITS API
   // (its +/-10s buttons -> seekTo -> engine). A raw `video.currentTime = x` into an unbuffered range
@@ -560,44 +582,64 @@
 
     dbg("seek", { origin, target: exactTarget, goingBack, buffered: bufStr(media), seeking: media.seeking, rs: media.readyState });
     let startWatchdog = () => {};
-    if (goingBack && findNativeJumpButton(media, -1)) {
-      nativeAssistedBackSeek(
-        media,
-        exactTarget,
-        st,
-        () => { lastCheckTime = exactTarget; startWatchdog(); },
-        (why) => { dbg("native assist failed -> raw seek:", why); setTime(exactTarget); lastCheckTime = exactTarget; startWatchdog(); }
-      );
-    } else {
-      if (goingBack) dbg("no native jump-back button found; using raw seek");
-      setTime(exactTarget);
-      st.nativeToken = (st.nativeToken || 0) + 1;
-    }
-
-    // Seek to a known-buffered anchor (this revives the player: forward/buffered seeks always work),
-    // then seek to the real target again once that settles.
-    const hopViaAnchor = (finalTarget) => {
-      const anchor = origin;
-      if (!isTimeBuffered(media, anchor) || Math.abs(anchor - finalTarget) < 0.5) {
-        setTime(finalTarget);
-        return;
-      }
-      let done = false;
-      const next = () => {
-        if (done) return;
-        done = true;
-        media.removeEventListener("seeked", next, true);
-        if (!media.isConnected || seekSettled || userIsPressingKeys()) return;
-        setTimeout(() => {
-          if (!media.isConnected || seekSettled || userIsPressingKeys()) return;
-          setTime(finalTarget);
-          lastCheckTime = finalTarget;
-        }, 120);
-      };
-      media.addEventListener("seeked", next, true);
-      st.recoveryTimers.push(setTimeout(next, 600));
-      setTime(anchor);
+    let watchdogStarted = false;
+    const beginWatchdog = () => {
+      if (watchdogStarted) return;
+      watchdogStarted = true;
+      startWatchdog();
     };
+
+    // Fallback chain for backward unbuffered seeks: player's own jump-back button, then a raw seek.
+    const runFallback = () => {
+      if (seekSettled) return;
+      if (findNativeJumpButton(media, -1)) {
+        nativeAssistedBackSeek(
+          media,
+          exactTarget,
+          st,
+          () => { lastCheckTime = exactTarget; beginWatchdog(); },
+          (why) => { dbg("native assist failed -> raw seek:", why); setTime(exactTarget); lastCheckTime = exactTarget; beginWatchdog(); }
+        );
+      } else {
+        dbg("no native jump-back button found; using raw seek");
+        setTime(exactTarget);
+        lastCheckTime = exactTarget;
+        beginWatchdog();
+      }
+    };
+
+    if (goingBack) {
+      // 1) Ask the MAIN-world bridge to seek through the player's own controller API.
+      const token = (st.nativeToken = (st.nativeToken || 0) + 1);
+      bridgeSeek(exactTarget).then((res) => {
+        if (seekSettled || token !== st.nativeToken) return;
+        if (!res.ok) {
+          dbg("bridge unavailable:", res.reason);
+          runFallback();
+          return;
+        }
+        dbg("bridge seek issued:", res.via);
+        const t0 = performance.now();
+        const verify = () => {
+          if (seekSettled || token !== st.nativeToken || !media.isConnected) return;
+          if (!media.seeking && media.readyState >= 3 && Math.abs(media.currentTime - exactTarget) < 1.5) {
+            dbg("bridge seek landed", { cur: media.currentTime });
+            lastCheckTime = media.currentTime;
+            beginWatchdog();
+            return;
+          }
+          if (performance.now() - t0 > 3000) {
+            dbg("bridge seek did not land -> fallback", { cur: media.currentTime, seeking: media.seeking, rs: media.readyState });
+            runFallback();
+            return;
+          }
+          setTimeout(verify, 100);
+        };
+        setTimeout(verify, 150);
+      });
+    } else {
+      setTime(exactTarget);
+    }
 
     const nudge = () => {
       nudgeStage++;
@@ -647,7 +689,7 @@
       st.recoveryTimers.push(setTimeout(completeCycle, 6000));
     };
     // Raw path starts watching immediately; native-assisted path starts once its final seek is issued.
-    if (!goingBack || !findNativeJumpButton(media, -1)) startWatchdog();
+    if (!goingBack) beginWatchdog();
     st.recoveryTimers.push(setTimeout(completeCycle, 15000));
   }
 
