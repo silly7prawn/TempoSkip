@@ -1,4 +1,4 @@
-// TempoSkip Content Script (v1.2.2)
+// TempoSkip Content Script (v1.2.3)
 // Runs at document_start across all frames to override playback speeds and Left/Right arrow skip durations.
 // Precision MSE seek engine: zero buffer snapping, serialized in-flight seeks, and pause-seek-play stall recovery.
 
@@ -75,6 +75,7 @@
   }
 
   function clearRecoveryWatchdog(st) {
+    st.nativeToken = (st.nativeToken || 0) + 1; // cancels any in-progress native-assisted seek
     if (st.recoveryTimers && st.recoveryTimers.length) {
       st.recoveryTimers.forEach((id) => clearTimeout(id));
       st.recoveryTimers = [];
@@ -414,6 +415,90 @@
     performRawSeekWithRecovery(media, exactTarget);
   }
 
+  // --- Player-native seek assist ---
+  // Crunchyroll's engine only re-targets its segment loader when the seek goes through ITS API
+  // (its +/-10s buttons -> seekTo -> engine). A raw `video.currentTime = x` into an unbuffered range
+  // *behind* the playhead leaves the loader fetching at the old position and the video freezes.
+  // So for unbuffered backward seeks we click the player's own "jump back" button until we are at or
+  // before the target (the engine now loads that area), then finish with a raw forward seek to the
+  // exact target, which the engine handles fine.
+  function findNativeJumpButton(media, dir) {
+    const back = dir < 0;
+    const roots = [document];
+    try {
+      const r = media.getRootNode && media.getRootNode();
+      if (r && r !== document && typeof r.querySelectorAll === "function") roots.unshift(r);
+    } catch (_) {}
+    const include = back ? /(back|rewind|replay|backward)/i : /(forward|ahead|fast)/i;
+    const exclude = back ? /(forward|ahead)/i : /(back|rewind|replay)/i;
+    const kind = /(jump|10|sec|rewind|replay|seek)/i;
+    const reject = /(intro|credit|outro|recap|episode|next|previous|prev|volume|caption|subtitle|setting|fullscreen)/i;
+    for (const root of roots) {
+      const nodes = root.querySelectorAll('button, [role="button"], [data-testid]');
+      for (const el of nodes) {
+        if (el.disabled || !el.isConnected) continue;
+        const cls = typeof el.className === "string" ? el.className : "";
+        const label = [el.getAttribute("aria-label"), el.getAttribute("title"), el.getAttribute("data-testid"), cls].join(" ");
+        if (!kind.test(label) || !include.test(label) || exclude.test(label) || reject.test(label)) continue;
+        return el;
+      }
+    }
+    return null;
+  }
+
+  function nativeAssistedBackSeek(media, target, st, onDone, onFail) {
+    const token = (st.nativeToken = (st.nativeToken || 0) + 1);
+    const alive = () => token === st.nativeToken && media.isConnected;
+    let clicks = 0;
+
+    const waitSeeked = (cb) => {
+      let fired = false;
+      const go = () => {
+        if (fired) return;
+        fired = true;
+        media.removeEventListener("seeked", go, true);
+        cb();
+      };
+      media.addEventListener("seeked", go, true);
+      setTimeout(go, 2500);
+    };
+
+    const finish = () => {
+      const t0 = performance.now();
+      const tryForward = () => {
+        if (!alive()) return;
+        if (isTimeBuffered(media, target) || performance.now() - t0 > 3000) {
+          dbg("native assist: final raw forward seek", { target, cur: media.currentTime, buffered: bufStr(media) });
+          try { media.currentTime = target; } catch (_) {}
+          onDone();
+          return;
+        }
+        setTimeout(tryForward, 100);
+      };
+      tryForward();
+    };
+
+    const step = () => {
+      if (!alive()) return;
+      if (media.currentTime <= target + 0.05) return finish();
+      if (clicks >= 6) return onFail("too many clicks");
+      const btn = findNativeJumpButton(media, -1);
+      if (!btn) return onFail("no jump-back button");
+      const before = media.currentTime;
+      clicks++;
+      dbg("native assist: click jump-back", { n: clicks, cur: before, target });
+      btn.click();
+      waitSeeked(() => {
+        setTimeout(() => {
+          if (!alive()) return;
+          if (Math.abs(media.currentTime - before) < 0.5) return onFail("click did not move playhead");
+          step();
+        }, 150);
+      });
+    };
+    step();
+  }
+
   function performRawSeekWithRecovery(media, exactTarget) {
     const st = getSeekState(media);
     clearRecoveryWatchdog(st);
@@ -474,7 +559,20 @@
     };
 
     dbg("seek", { origin, target: exactTarget, goingBack, buffered: bufStr(media), seeking: media.seeking, rs: media.readyState });
-    setTime(exactTarget);
+    let startWatchdog = () => {};
+    if (goingBack && findNativeJumpButton(media, -1)) {
+      nativeAssistedBackSeek(
+        media,
+        exactTarget,
+        st,
+        () => { lastCheckTime = exactTarget; startWatchdog(); },
+        (why) => { dbg("native assist failed -> raw seek:", why); setTime(exactTarget); lastCheckTime = exactTarget; startWatchdog(); }
+      );
+    } else {
+      if (goingBack) dbg("no native jump-back button found; using raw seek");
+      setTime(exactTarget);
+      st.nativeToken = (st.nativeToken || 0) + 1;
+    }
 
     // Seek to a known-buffered anchor (this revives the player: forward/buffered seeks always work),
     // then seek to the real target again once that settles.
@@ -542,10 +640,15 @@
       );
     }
 
-    [700, 1500, 2500, 3800].forEach((ms) => {
-      st.recoveryTimers.push(setTimeout(() => { checkStall(); lastCheckTime = media.currentTime; }, ms));
-    });
-    st.recoveryTimers.push(setTimeout(completeCycle, 6000));
+    startWatchdog = () => {
+      [700, 1500, 2500, 3800].forEach((ms) => {
+        st.recoveryTimers.push(setTimeout(() => { checkStall(); lastCheckTime = media.currentTime; }, ms));
+      });
+      st.recoveryTimers.push(setTimeout(completeCycle, 6000));
+    };
+    // Raw path starts watching immediately; native-assisted path starts once its final seek is issued.
+    if (!goingBack || !findNativeJumpButton(media, -1)) startWatchdog();
+    st.recoveryTimers.push(setTimeout(completeCycle, 15000));
   }
 
   function seekMediaByDelta(media, deltaSeconds, isRepeatKey = false) {
