@@ -279,6 +279,7 @@ h1 {
   width: 14px;
   height: 14px;
   cursor: pointer;
+  flex-shrink: 0;
 }
 
 kbd {
