@@ -1,4 +1,4 @@
-// TempoSkip Content Script (v1.3.3)
+// TempoSkip Content Script (v1.4.0)
 // Runs at document_start across all frames to override playback speeds and Left/Right arrow skip durations.
 // Precision MSE seek engine: zero buffer snapping, serialized in-flight seeks, and pause-seek-play stall recovery.
 
@@ -415,9 +415,42 @@
     performRawSeekWithRecovery(media, exactTarget);
   }
 
+  // --- Learned per-site profiles (chrome.storage.local) ---
+  // { [hostname]: { bridge: "ok" | "none", path, fn, via, fail, fallback, ts } }
+  // "ok"   = the page-world bridge found the player's native seek API at `path`; reused as a hint next time.
+  // "none" = no usable API was found; skip the (costly) search for NEG_TTL_MS, then try again.
+  const HOST_KEY = (window.location.hostname || "").toLowerCase();
+  const NEG_TTL_MS = 6 * 60 * 60 * 1000;
+  let siteProfiles = {};
+  function loadSiteProfiles() {
+    try {
+      chrome.storage.local.get("siteProfiles", (r) => {
+        if (chrome.runtime.lastError) return;
+        siteProfiles = (r && r.siteProfiles) || {};
+      });
+    } catch (_) {}
+  }
+  loadSiteProfiles();
+  function updateSiteProfile(patch) {
+    if (!HOST_KEY) return;
+    try {
+      // Read-modify-write so several frames/tabs don't clobber each other's entries.
+      chrome.storage.local.get("siteProfiles", (r) => {
+        if (chrome.runtime.lastError) return;
+        const all = (r && r.siteProfiles) || {};
+        const cur = all[HOST_KEY] || {};
+        const next = { ...cur, ...patch, ts: Date.now() };
+        if (JSON.stringify({ ...cur, ts: 0 }) === JSON.stringify({ ...next, ts: 0 })) return; // nothing new
+        all[HOST_KEY] = next;
+        siteProfiles = all;
+        chrome.storage.local.set({ siteProfiles: all });
+      });
+    } catch (_) {}
+  }
+
   // --- MAIN-world bridge client (see bridge.js) ---
   let bridgeReqId = 0;
-  function bridgeSeek(t) {
+  function bridgeSeek(t, hint) {
     return new Promise((resolve) => {
       const id = ++bridgeReqId;
       const onRes = (ev) => {
@@ -433,7 +466,7 @@
         resolve({ ok: false, reason: "bridge timeout" });
       }, 400);
       document.addEventListener("temposkip:res", onRes);
-      document.dispatchEvent(new CustomEvent("temposkip:req", { detail: JSON.stringify({ id, op: "seek", t }) }));
+      document.dispatchEvent(new CustomEvent("temposkip:req", { detail: JSON.stringify({ id, op: "seek", t, hint: hint || null }) }));
     });
   }
 
@@ -597,8 +630,8 @@
           media,
           exactTarget,
           st,
-          () => { lastCheckTime = exactTarget; beginWatchdog(); },
-          (why) => { dbg("native assist failed -> raw seek:", why); setTime(exactTarget); lastCheckTime = exactTarget; beginWatchdog(); }
+          () => { updateSiteProfile({ fallback: "button" }); lastCheckTime = exactTarget; beginWatchdog(); },
+          (why) => { dbg("native assist failed -> raw seek:", why); updateSiteProfile({ fallback: "raw" }); setTime(exactTarget); lastCheckTime = exactTarget; beginWatchdog(); }
         );
       } else {
         dbg("no native jump-back button found; using raw seek");
@@ -609,34 +642,49 @@
     };
 
     if (goingBack) {
-      // 1) Ask the MAIN-world bridge to seek through the player's own controller API.
+      // 1) Ask the MAIN-world bridge to seek through the player's own controller API
+      //    (using this site's learned profile as a hint, and skipping the search where it found nothing recently).
       const token = (st.nativeToken = (st.nativeToken || 0) + 1);
-      bridgeSeek(exactTarget).then((res) => {
-        if (seekSettled || token !== st.nativeToken) return;
-        if (!res.ok) {
-          dbg("bridge unavailable:", res.reason);
-          runFallback();
-          return;
-        }
-        dbg("bridge seek issued:", res.via);
-        const t0 = performance.now();
-        const verify = () => {
-          if (seekSettled || token !== st.nativeToken || !media.isConnected) return;
-          if (!media.seeking && media.readyState >= 3 && Math.abs(media.currentTime - exactTarget) < 1.5) {
-            dbg("bridge seek landed", { cur: media.currentTime });
-            lastCheckTime = media.currentTime;
-            beginWatchdog();
-            return;
-          }
-          if (performance.now() - t0 > 3000) {
-            dbg("bridge seek did not land -> fallback", { cur: media.currentTime, seeking: media.seeking, rs: media.readyState });
+      const prof = siteProfiles[HOST_KEY] || null;
+      const knownNone = prof && prof.bridge === "none" && Date.now() - (prof.ts || 0) < NEG_TTL_MS;
+      if (knownNone) {
+        dbg("site profile: no player API here (cached) -> skipping bridge");
+        runFallback();
+      } else {
+        const hint = prof && prof.bridge === "ok" && prof.path && prof.fn ? { path: prof.path, fn: prof.fn } : null;
+        bridgeSeek(exactTarget, hint).then((res) => {
+          if (seekSettled || token !== st.nativeToken) return;
+          if (!res.ok) {
+            dbg("bridge unavailable:", res.reason);
+            if (/^no calibrated seek API/.test(res.reason || "")) updateSiteProfile({ bridge: "none", path: null, fn: null, via: null });
             runFallback();
             return;
           }
-          setTimeout(verify, 100);
-        };
-        setTimeout(verify, 150);
-      });
+          dbg("bridge seek issued:", res.via);
+          const t0 = performance.now();
+          const verify = () => {
+            if (seekSettled || token !== st.nativeToken || !media.isConnected) return;
+            if (!media.seeking && media.readyState >= 3 && Math.abs(media.currentTime - exactTarget) < 1.5) {
+              dbg("bridge seek landed", { cur: media.currentTime });
+              const p = res.profile || {};
+              updateSiteProfile({ bridge: "ok", path: p.path, fn: p.fn, via: p.via, fail: 0 });
+              lastCheckTime = media.currentTime;
+              beginWatchdog();
+              return;
+            }
+            if (performance.now() - t0 > 3000) {
+              dbg("bridge seek did not land -> fallback", { cur: media.currentTime, seeking: media.seeking, rs: media.readyState });
+              const fails = ((prof && prof.fail) || 0) + 1;
+              // After repeated failures stop trusting the API on this site for a while.
+              updateSiteProfile(fails >= 3 ? { bridge: "none", fail: fails } : { fail: fails });
+              runFallback();
+              return;
+            }
+            setTimeout(verify, 100);
+          };
+          setTimeout(verify, 150);
+        });
+      }
     } else {
       setTime(exactTarget);
     }
@@ -874,6 +922,10 @@
   });
 
   chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === "local" && changes.siteProfiles) {
+      siteProfiles = changes.siteProfiles.newValue || {};
+      return;
+    }
     if (area !== "sync") return;
     let speedChanged = false;
     for (const [key, change] of Object.entries(changes)) {

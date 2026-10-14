@@ -245,6 +245,52 @@ els.resetDefaultsBtn.addEventListener("click", async () => {
   renderUI();
 });
 
+// --- Learned per-site seek profiles ---
+function renderLearned(profiles) {
+  const list = document.getElementById("learnedList");
+  list.textContent = "";
+  const hosts = Object.keys(profiles || {}).sort();
+  if (!hosts.length) {
+    const e = document.createElement("div");
+    e.className = "learned-empty";
+    e.textContent = "Nothing learned yet. Sites appear here after an out-of-buffer rewind.";
+    list.appendChild(e);
+    return;
+  }
+  for (const host of hosts) {
+    const p = profiles[host] || {};
+    const row = document.createElement("div");
+    row.className = "learned-row";
+    const name = document.createElement("span");
+    name.className = "host";
+    name.textContent = host;
+    name.title = p.path ? p.path + "." + p.fn : "";
+    const tag = document.createElement("span");
+    tag.className = "tag" + (p.bridge === "ok" ? " ok" : "");
+    tag.textContent = p.bridge === "ok" ? "player API" : "fallback: " + (p.fallback || "raw");
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "del";
+    del.title = "Forget this site";
+    del.textContent = "\u2715";
+    del.addEventListener("click", () => {
+      chrome.storage.local.get("siteProfiles", (r) => {
+        const all = (r && r.siteProfiles) || {};
+        delete all[host];
+        chrome.storage.local.set({ siteProfiles: all }, () => renderLearned(all));
+      });
+    });
+    row.append(name, tag, del);
+    list.appendChild(row);
+  }
+}
+function loadLearned() {
+  chrome.storage.local.get("siteProfiles", (r) => renderLearned((r && r.siteProfiles) || {}));
+}
+document.getElementById("forgetAllBtn").addEventListener("click", () => {
+  chrome.storage.local.set({ siteProfiles: {} }, () => renderLearned({}));
+});
+
 // Diagnostics: run the page-world probe in every frame of the active tab and copy the result.
 document.getElementById("copyDiagBtn").addEventListener("click", async () => {
   const status = document.getElementById("diagStatus");
@@ -267,7 +313,8 @@ document.getElementById("copyDiagBtn").addEventListener("click", async () => {
     const useful = results
       .filter((r) => r && r.result && !(r.result.note && /no <video>/.test(r.result.note)))
       .map((r) => ({ frameId: r.frameId, ...r.result }));
-    const text = JSON.stringify({ version: chrome.runtime.getManifest().version, tab: tab.url, frames: useful }, null, 2);
+    const learned = await new Promise((res) => chrome.storage.local.get("siteProfiles", (r) => res((r && r.siteProfiles) || {})));
+    const text = JSON.stringify({ version: chrome.runtime.getManifest().version, tab: tab.url, learnedProfiles: learned, frames: useful }, null, 2);
     await navigator.clipboard.writeText(text);
     status.textContent = useful.length ? "Copied – paste it into the chat." : "Copied (no video found in this tab).";
   } catch (e) {
@@ -280,4 +327,5 @@ chrome.storage.sync.get(null, (stored) => {
   currentSettings = { ...DEFAULT_SETTINGS, ...(stored || {}) };
   renderUI();
   queryActiveTabStatus();
+  loadLearned();
 });

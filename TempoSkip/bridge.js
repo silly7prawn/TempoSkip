@@ -1,4 +1,4 @@
-// TempoSkip MAIN-world bridge (v1.3.3)
+// TempoSkip MAIN-world bridge (v1.4.0)
 // Runs in the PAGE's JS world (not the isolated content-script world) so it can reach the web player's
 // own controller object and call its native seek API. Some players (Crunchyroll) run their MSE engine
 // behind a message boundary and only re-target their segment loader when seeks go through that API; a raw
@@ -211,21 +211,51 @@
     return vids.find((v) => !v.paused) || vids.sort((a, b) => b.clientWidth * b.clientHeight - a.clientWidth * a.clientHeight)[0];
   }
 
-  function ensure(video) {
-    if (cached && cached.video === video) return cached;
+  // Resolve a previously learned path (from the extension's per-site profile) without a full search.
+  function tryHint(video, hint) {
+    if (!hint || !hint.path || !hint.fn) return null;
+    for (const r of collectRoots(video)) {
+      if (hint.path !== r.p && !hint.path.startsWith(r.p + ".")) continue;
+      let o = r.o;
+      const rest = hint.path === r.p ? [] : hint.path.slice(r.p.length + 1).split(".");
+      for (const seg of rest) {
+        o = o ? safeGet(o, seg) : null;
+        if (!o || typeof o !== "object") { o = null; break; }
+      }
+      if (o && typeof safeGet(o, hint.fn) === "function") {
+        const cal = calibrate(o, video);
+        if (cal.a !== null) return { owner: o, name: hint.fn, rank: 0, clock: cal, path: hint.path, video, report: { hinted: true }, hinted: true };
+      }
+    }
+    return null;
+  }
+
+  // Only successful lookups are cached; a miss is retried next time (players mount late).
+  function ensure(video, hint) {
+    if (cached && cached.video === video && cached.owner) return cached;
+    const hinted = tryHint(video, hint);
+    if (hinted) { cached = hinted; return cached; }
     const { best, report } = discover(video);
-    cached = best ? { ...best, video, report } : { video, owner: null, report };
+    if (best) cached = { ...best, video, report };
+    else return { video, owner: null, report };
     return cached;
   }
 
-  function doSeek(t) {
+  function doSeek(t, hint) {
     const video = getVideo();
     if (!video) return { ok: false, reason: "no video" };
-    const c = ensure(video);
+    let c = ensure(video, hint);
     if (!c.owner) return { ok: false, reason: "no calibrated seek API found" };
     // Re-calibrate every call: the offset is cheap to measure and guards against drift / ads.
-    const cal = calibrate(c.owner, video);
-    if (cal.a === null) return { ok: false, reason: "clock lost" };
+    let cal = calibrate(c.owner, video);
+    if (cal.a === null) {
+      // The cached controller went stale (e.g. the player remounted for a new episode): rediscover once.
+      cached = null;
+      c = ensure(video, null);
+      if (!c.owner) return { ok: false, reason: "no calibrated seek API found" };
+      cal = calibrate(c.owner, video);
+      if (cal.a === null) return { ok: false, reason: "clock lost" };
+    }
     let arg = cal.a * t + cal.b;
     if (cal.mode === "convert") {
       try { arg = cal.conv.fn.call(cal.conv.thisObj, t); } catch (e) { return { ok: false, reason: "convert threw: " + (e && e.message) }; }
@@ -233,8 +263,14 @@
     }
     try {
       c.owner[c.name](arg);
-      return { ok: true, via: c.path + "." + c.name + "(" + arg.toFixed(2) + ") [" + cal.mode + "]" };
+      return {
+        ok: true,
+        hinted: !!c.hinted,
+        profile: { path: c.path, fn: c.name, mode: cal.mode, via: cal.via },
+        via: c.path + "." + c.name + "(" + arg.toFixed(2) + ") [" + cal.mode + (c.hinted ? ", from learned profile" : "") + "]"
+      };
     } catch (e) {
+      cached = null;
       return { ok: false, reason: "seek threw: " + (e && e.message) };
     }
   }
@@ -243,7 +279,7 @@
     let req;
     try { req = JSON.parse(ev.detail); } catch (_) { return; }
     if (!req || req.op !== "seek") return;
-    const res = doSeek(Number(req.t));
+    const res = doSeek(Number(req.t), req.hint || null);
     res.id = req.id;
     document.dispatchEvent(new CustomEvent("temposkip:res", { detail: JSON.stringify(res) }));
   });
