@@ -1,4 +1,4 @@
-// TempoSkip Content Script (v1.2.0)
+// TempoSkip Content Script (v1.2.1)
 // Runs at document_start across all frames to override playback speeds and Left/Right arrow skip durations.
 // Precision MSE seek engine: zero buffer snapping, serialized in-flight seeks, and pause-seek-play stall recovery.
 
@@ -54,7 +54,8 @@
         hudResetTimer: null,         // Resets accumulatedDelta after user stops pressing keys
         recoveryTimers: [],          // Post-seek stall detection timers
         recoveryCleanup: null,       // Listener cleanup function
-        suspendRateEnforcement: false
+        suspendRateEnforcement: false,
+        originTime: 0                // currentTime when the seek cycle began (known-buffered anchor)
       };
       mediaSeekState.set(media, st);
     }
@@ -406,7 +407,6 @@
     clearRecoveryWatchdog(st);
 
     const targetIsBuffered = isTimeBuffered(media, exactTarget);
-    const shouldResumePlay = st.wasPlayingBeforeSeek;
 
     // Fast path when seeking inside an already-buffered range
     if (!settings.safeMseSeek || targetIsBuffered) {
@@ -416,20 +416,21 @@
       st.virtualTargetTime = null;
       st.cycleActive = false;
       st.suspendRateEnforcement = false;
-      if (shouldResumePlay && media.paused) {
-        st.pausedByUs = false;
-        media.play().catch(() => {});
-      }
       if (isSiteEnabled()) {
         applySpeedToMedia(media, settings.playbackSpeed);
       }
       return;
     }
 
-    // --- Out-of-Buffer Precision Seek Path (Crunchyroll / Shaka / HLS / DASH) ---
+    // --- Out-of-Buffer Seek Path (Crunchyroll / Shaka / HLS / DASH) ---
+    // We never pause()/play() the element ourselves: a native seek keeps `paused` untouched and the
+    // browser resumes by itself once data arrives. If the page's player fails to fetch the new
+    // position (the "hang"), we recover by issuing seeks to *different* timestamps, which is what
+    // the player's built-in +/-10s buttons do and what makes its segment loader restart.
     st.suspendRateEnforcement = true;
     let seekSettled = false;
-    let reseekWakeAttempted = false;
+    let nudgeStage = 0;
+    const { minSeek, maxSeek } = getSeekableBounds(media);
 
     const completeCycle = () => {
       if (seekSettled) return;
@@ -439,23 +440,17 @@
       st.cycleActive = false;
       st.suspendRateEnforcement = false;
       st.pausedByUs = false;
-
       if (isSiteEnabled()) {
         applySpeedToMedia(media, settings.playbackSpeed);
       }
-      if (shouldResumePlay && media.paused) {
-        media.play().catch(() => {});
-      }
     };
 
+    const userIsPressingKeys = () => st.debounceTimer !== null || st.queuedTargetTime !== null;
+    const isHealthy = () => !media.seeking && media.readyState >= 3;
+
     const onSeekedOrCanPlay = () => {
-      // If user started pressing keys again, abort this recovery and let the new debounce handle it
-      if (st.debounceTimer !== null || st.queuedTargetTime !== null) return;
-      if (!media.seeking && media.readyState >= 3) {
-        completeCycle();
-      } else if (!media.seeking && shouldResumePlay && media.paused) {
-        media.play().catch(() => {});
-      }
+      if (userIsPressingKeys()) return;
+      if (isHealthy()) completeCycle();
     };
 
     media.addEventListener("seeked", onSeekedOrCanPlay, true);
@@ -468,59 +463,67 @@
       media.removeEventListener("playing", onSeekedOrCanPlay, true);
     };
 
+    const setTime = (t) => {
+      try {
+        media.currentTime = Math.min(maxSeek, Math.max(minSeek, t));
+      } catch (_) {}
+    };
+
     // Issue the single exact seek
-    try {
-      media.currentTime = exactTarget;
-    } catch (_) {}
+    setTime(exactTarget);
 
-    // Watchdog: If Crunchyroll's MSE controller gets stuck in `waiting`/`seeking` or paused with no playback
-    // after an unbuffered seek, perform a clean `pause() -> currentTime = exactTarget -> play()` wake cycle
-    // (the exact same sequence triggered when clicking a player-inbuilt seek button, while keeping exactTarget).
-    const checkStallAndWake = (stage) => {
-      if (!media.isConnected || seekSettled) return;
-      if (st.debounceTimer !== null || st.queuedTargetTime !== null) return;
-
-      // If readyState is healthy and media is playing normally, finish cycle
-      if (!media.seeking && media.readyState >= 3 && (!shouldResumePlay || !media.paused)) {
-        completeCycle();
-        return;
-      }
-
-      // If the player is still stuck at stage >= 2 (~1100ms) and hasn't recovered:
-      if (stage >= 2 && !reseekWakeAttempted && (media.seeking || media.readyState < 3 || (shouldResumePlay && media.paused))) {
-        reseekWakeAttempted = true;
-        try {
-          media.pause();
-        } catch (_) {}
-        setTimeout(() => {
-          if (st.debounceTimer !== null) return;
-          try {
-            // Re-assert exact target time to wake up the MSE segment loader (no buffer snapping)
-            media.currentTime = exactTarget;
-          } catch (_) {}
-          if (shouldResumePlay) {
-            setTimeout(() => {
-              if (st.debounceTimer === null && media.paused) {
-                media.play().catch(() => {});
-              }
-            }, 80);
-          }
-        }, 60);
-        return;
-      }
-
-      if (shouldResumePlay && media.paused && !media.seeking && media.readyState >= 2) {
-        media.play().catch(() => {});
+    const nudge = () => {
+      nudgeStage++;
+      if (nudgeStage === 1) {
+        // Re-issue the seek at a slightly different time so the player treats it as a new seek.
+        setTime(exactTarget + (exactTarget + 0.2 <= maxSeek ? 0.2 : -0.2));
+      } else if (nudgeStage === 2) {
+        // Hop back to the known-buffered origin, then seek to the target again once that settles.
+        const anchor = Number.isFinite(st.originTime) ? st.originTime : minSeek;
+        if (isTimeBuffered(media, anchor) && Math.abs(anchor - exactTarget) > 0.5) {
+          let hopped = false;
+          const hopBack = () => {
+            if (hopped) return;
+            hopped = true;
+            media.removeEventListener("seeked", hopBack, true);
+            if (!media.isConnected || seekSettled || userIsPressingKeys()) return;
+            setTime(exactTarget);
+          };
+          media.addEventListener("seeked", hopBack, true);
+          const tid = setTimeout(hopBack, 500);
+          st.recoveryTimers.push(tid);
+          setTime(anchor);
+        } else {
+          setTime(exactTarget - 0.3);
+        }
+      } else {
+        // Last resort: the player may have left itself paused after the failed load.
+        setTime(exactTarget);
+        if (st.wasPlayingBeforeSeek && media.paused) {
+          const tid = setTimeout(() => {
+            if (media.isConnected && !seekSettled && media.paused && !userIsPressingKeys()) {
+              media.play().catch(() => {});
+            }
+          }, 150);
+          st.recoveryTimers.push(tid);
+        }
       }
     };
 
-    [450, 1100, 2000].forEach((ms, idx) => {
-      const tid = setTimeout(() => checkStallAndWake(idx + 1), ms);
-      st.recoveryTimers.push(tid);
-    });
+    const checkStall = () => {
+      if (!media.isConnected || seekSettled) return;
+      if (userIsPressingKeys()) return;
+      if (isHealthy()) {
+        completeCycle();
+        return;
+      }
+      nudge();
+    };
 
-    const finalTid = setTimeout(completeCycle, 2900);
-    st.recoveryTimers.push(finalTid);
+    [900, 1900, 3200].forEach((ms) => {
+      st.recoveryTimers.push(setTimeout(checkStall, ms));
+    });
+    st.recoveryTimers.push(setTimeout(completeCycle, 5000));
   }
 
   function seekMediaByDelta(media, deltaSeconds, isRepeatKey = false) {
@@ -535,6 +538,7 @@
       st.cycleActive = true;
       st.wasPlayingBeforeSeek = !media.paused && !media.ended;
       st.virtualTargetTime = Number(media.currentTime) || 0;
+      st.originTime = st.virtualTargetTime;
     }
 
     // Reset HUD delta counter only if enough time elapsed since the last keypress
@@ -573,14 +577,8 @@
       // Cancel any post-seek recovery from a prior seek while the user is still clicking
       clearRecoveryWatchdog(st);
 
-      // Pause active playback during rapid unbuffered scrubbing so Crunchyroll's MSE decoder
-      // doesn't fight in-flight frame decoding while the user is still tapping arrow keys.
-      if (!targetIsBuffered && st.wasPlayingBeforeSeek && !media.paused) {
-        st.pausedByUs = true;
-        try {
-          media.pause();
-        } catch (_) {}
-      }
+      // NOTE: we deliberately never pause() the media here. Programmatic pause/play desyncs
+      // the page player's own play-state tracking (Crunchyroll hangs waiting for a play that never comes).
 
       if (st.debounceTimer) {
         clearTimeout(st.debounceTimer);
