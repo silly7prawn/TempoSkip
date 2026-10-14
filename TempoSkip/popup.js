@@ -245,6 +245,36 @@ els.resetDefaultsBtn.addEventListener("click", async () => {
   renderUI();
 });
 
+// Diagnostics: run the page-world probe in every frame of the active tab and copy the result.
+document.getElementById("copyDiagBtn").addEventListener("click", async () => {
+  const status = document.getElementById("diagStatus");
+  status.textContent = "Collecting…";
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    const results = await chrome.scripting.executeScript({
+      target: { tabId: tab.id, allFrames: true },
+      world: "MAIN",
+      func: () => {
+        try {
+          if (typeof window.__temposkipProbe !== "function") return { bridge: false, frame: location.href.slice(0, 120) };
+          const r = window.__temposkipProbe();
+          return typeof r === "string" ? { bridge: true, note: r, frame: location.href.slice(0, 120) } : r;
+        } catch (e) {
+          return { error: String(e && e.message) };
+        }
+      }
+    });
+    const useful = results
+      .filter((r) => r && r.result && !(r.result.note && /no <video>/.test(r.result.note)))
+      .map((r) => ({ frameId: r.frameId, ...r.result }));
+    const text = JSON.stringify({ version: chrome.runtime.getManifest().version, tab: tab.url, frames: useful }, null, 2);
+    await navigator.clipboard.writeText(text);
+    status.textContent = useful.length ? "Copied – paste it into the chat." : "Copied (no video found in this tab).";
+  } catch (e) {
+    status.textContent = "Failed: " + (e && e.message ? e.message : e);
+  }
+});
+
 // Initialize popup state
 chrome.storage.sync.get(null, (stored) => {
   currentSettings = { ...DEFAULT_SETTINGS, ...(stored || {}) };

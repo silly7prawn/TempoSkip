@@ -145,9 +145,9 @@
 
     <!-- Stream & Buffer Stability + Extra Controls -->
     <section class="card compact-card">
-      <label class="check-row" title="Coalesces rapid multi-clicks & serializes unbuffered MSE seeks without snapping">
+      <label class="check-row" title="Batches rapid skips into one seek and helps streaming players recover from out-of-buffer seeks">
         <input type="checkbox" id="safeMseSeekToggle" checked />
-        <span>Serialize rapid &amp; unbuffered MSE seeks (Crunchyroll fix)</span>
+        <span>Smart seeking on streaming sites (batch rapid skips, recover stalls)</span>
       </label>
       <label class="check-row">
         <input type="checkbox" id="speedHotkeysToggle" checked />
@@ -161,6 +161,8 @@
 
     <footer class="footer">
       <button type="button" class="reset-btn" id="resetDefaultsBtn">Reset All to Defaults</button>
+      <button type="button" class="reset-btn" id="copyDiagBtn" title="Copies player diagnostics from the current tab to your clipboard">Copy diagnostics</button>
+      <div id="diagStatus" class="diag-status" aria-live="polite"></div>
     </footer>
   </div>
   <script src="popup.js"></script>

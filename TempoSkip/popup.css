@@ -402,3 +402,6 @@ kbd {
   color: #f8fafc;
   border-color: #475569;
 }
+
+#copyDiagBtn { margin-top: 6px; }
+.diag-status { font-size: 11px; opacity: 0.75; margin-top: 4px; min-height: 14px; word-break: break-word; }

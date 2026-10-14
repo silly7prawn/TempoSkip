@@ -80,6 +80,7 @@
   // BFS over objects looking for owners that expose a seek-like function.
   function findOwners(video) {
     const found = [];
+    const near = [];
     const visited = new WeakSet();
     const queue = collectRoots(video).map((r) => ({ o: r.o, p: r.p, d: 0 }));
     let nodes = 0;
@@ -93,6 +94,10 @@
       const names = methodNames(o);
       const seekNames = names.filter((n) => SEEK_NAMES.test(n) && typeof safeGet(o, n) === "function");
       if (seekNames.length) found.push({ owner: o, seekNames, path: p, names });
+      else if (near.length < 25) {
+        const hits = names.filter((n) => /seek|jump|rewind|skip|timeline|playhead/i.test(n) && typeof safeGet(o, n) === "function");
+        if (hits.length) near.push({ path: p, methods: hits.slice(0, 12) });
+      }
 
       if (d >= 4) continue;
       let keys = [];
@@ -102,7 +107,7 @@
         if (v && typeof v === "object") queue.push({ o: v, p: p + "." + k, d: d + 1 });
       }
     }
-    return { found, nodes };
+    return { found, nodes, near };
   }
 
   // Work out how the player's clock relates to video.currentTime: timeline = a * currentTime + b
@@ -130,8 +135,8 @@
   }
 
   function discover(video) {
-    const { found, nodes } = findOwners(video);
-    const report = { nodes, candidates: [] };
+    const { found, nodes, near } = findOwners(video);
+    const report = { nodes, candidates: [], nearMisses: near };
     let best = null;
     for (const c of found) {
       const cal = calibrate(c.owner, video);
@@ -196,6 +201,13 @@
     const out = {
       frame: location.href.slice(0, 120),
       fiberKeyOnVideoOrAncestors: (() => { for (let e = video; e; e = e.parentElement) { const k = getFiberKey(e); if (k) return k.slice(0, 20); } return null; })(),
+      video: {
+        src: String(video.currentSrc || video.src || "").slice(0, 40),
+        hasSrcObject: !!video.srcObject,
+        duration: video.duration, currentTime: video.currentTime, rate: video.playbackRate,
+        buffered: (() => { try { const o = []; for (let i = 0; i < video.buffered.length; i++) o.push(video.buffered.start(i).toFixed(1) + "-" + video.buffered.end(i).toFixed(1)); return o.join(","); } catch (_) { return "?"; } })()
+      },
+      reactDetected: !!(function () { for (let e = video; e; e = e.parentElement) { if (getFiberKey(e)) return true; } return false; })(),
       report: c.report,
       jumpishButtons: Array.from(document.querySelectorAll("button,[role=button]"))
         .filter((b) => /jump|10|seek|rewind|replay|forward|back|skip/i.test((b.getAttribute("aria-label") || "") + (b.getAttribute("title") || "") + (b.getAttribute("data-testid") || "") + (b.className || "")))
