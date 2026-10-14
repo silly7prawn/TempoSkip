@@ -1,4 +1,4 @@
-// TempoSkip Content Script (v1.2.1)
+// TempoSkip Content Script (v1.2.2)
 // Runs at document_start across all frames to override playback speeds and Left/Right arrow skip durations.
 // Precision MSE seek engine: zero buffer snapping, serialized in-flight seeks, and pause-seek-play stall recovery.
 
@@ -28,6 +28,18 @@
     showHud: true,
     disabledHosts: []
   };
+
+  // Opt-in diagnostics: run  localStorage.temposkipDebug = "1"  in the player frame's console, then reload.
+  let DEBUG = false;
+  try { DEBUG = localStorage.getItem("temposkipDebug") === "1"; } catch (_) {}
+  const dbg = (...a) => { if (DEBUG) console.log("[TempoSkip]", ...a); };
+  function bufStr(m) {
+    try {
+      const out = [];
+      for (let i = 0; i < m.buffered.length; i++) out.push(m.buffered.start(i).toFixed(1) + "-" + m.buffered.end(i).toFixed(1));
+      return out.join(",");
+    } catch (_) { return "?"; }
+  }
 
   const trackedMedia = new Set();
   const mediaSeekState = new WeakMap();
@@ -409,7 +421,7 @@
     const targetIsBuffered = isTimeBuffered(media, exactTarget);
 
     // Fast path when seeking inside an already-buffered range
-    if (!settings.safeMseSeek || targetIsBuffered) {
+    if (targetIsBuffered) {
       try {
         media.currentTime = exactTarget;
       } catch (_) {}
@@ -431,6 +443,9 @@
     let seekSettled = false;
     let nudgeStage = 0;
     const { minSeek, maxSeek } = getSeekableBounds(media);
+    const origin = Number.isFinite(st.originTime) ? st.originTime : minSeek;
+    const goingBack = exactTarget < origin;
+    let lastCheckTime = exactTarget;
 
     const completeCycle = () => {
       if (seekSettled) return;
@@ -446,22 +461,11 @@
     };
 
     const userIsPressingKeys = () => st.debounceTimer !== null || st.queuedTargetTime !== null;
-    const isHealthy = () => !media.seeking && media.readyState >= 3;
-
-    const onSeekedOrCanPlay = () => {
-      if (userIsPressingKeys()) return;
-      if (isHealthy()) completeCycle();
-    };
-
-    media.addEventListener("seeked", onSeekedOrCanPlay, true);
-    media.addEventListener("canplay", onSeekedOrCanPlay, true);
-    media.addEventListener("playing", onSeekedOrCanPlay, true);
-
-    st.recoveryCleanup = () => {
-      media.removeEventListener("seeked", onSeekedOrCanPlay, true);
-      media.removeEventListener("canplay", onSeekedOrCanPlay, true);
-      media.removeEventListener("playing", onSeekedOrCanPlay, true);
-    };
+    // Healthy = not seeking, has data, and (paused or the clock is really advancing).
+    const isHealthy = () =>
+      !media.seeking &&
+      media.readyState >= 3 &&
+      (media.paused || Math.abs(media.currentTime - lastCheckTime) > 0.02);
 
     const setTime = (t) => {
       try {
@@ -469,43 +473,53 @@
       } catch (_) {}
     };
 
-    // Issue the single exact seek
+    dbg("seek", { origin, target: exactTarget, goingBack, buffered: bufStr(media), seeking: media.seeking, rs: media.readyState });
     setTime(exactTarget);
+
+    // Seek to a known-buffered anchor (this revives the player: forward/buffered seeks always work),
+    // then seek to the real target again once that settles.
+    const hopViaAnchor = (finalTarget) => {
+      const anchor = origin;
+      if (!isTimeBuffered(media, anchor) || Math.abs(anchor - finalTarget) < 0.5) {
+        setTime(finalTarget);
+        return;
+      }
+      let done = false;
+      const next = () => {
+        if (done) return;
+        done = true;
+        media.removeEventListener("seeked", next, true);
+        if (!media.isConnected || seekSettled || userIsPressingKeys()) return;
+        setTimeout(() => {
+          if (!media.isConnected || seekSettled || userIsPressingKeys()) return;
+          setTime(finalTarget);
+          lastCheckTime = finalTarget;
+        }, 120);
+      };
+      media.addEventListener("seeked", next, true);
+      st.recoveryTimers.push(setTimeout(next, 600));
+      setTime(anchor);
+    };
 
     const nudge = () => {
       nudgeStage++;
+      dbg("stall -> nudge", nudgeStage, { cur: media.currentTime, seeking: media.seeking, rs: media.readyState, paused: media.paused, buffered: bufStr(media) });
       if (nudgeStage === 1) {
-        // Re-issue the seek at a slightly different time so the player treats it as a new seek.
-        setTime(exactTarget + (exactTarget + 0.2 <= maxSeek ? 0.2 : -0.2));
+        // Re-issue at a slightly different time so the player treats it as a brand-new seek.
+        const d = goingBack ? -0.25 : 0.25;
+        const t = exactTarget + d;
+        setTime(t >= minSeek && t <= maxSeek ? t : exactTarget - d);
+        lastCheckTime = media.currentTime;
       } else if (nudgeStage === 2) {
-        // Hop back to the known-buffered origin, then seek to the target again once that settles.
-        const anchor = Number.isFinite(st.originTime) ? st.originTime : minSeek;
-        if (isTimeBuffered(media, anchor) && Math.abs(anchor - exactTarget) > 0.5) {
-          let hopped = false;
-          const hopBack = () => {
-            if (hopped) return;
-            hopped = true;
-            media.removeEventListener("seeked", hopBack, true);
-            if (!media.isConnected || seekSettled || userIsPressingKeys()) return;
-            setTime(exactTarget);
-          };
-          media.addEventListener("seeked", hopBack, true);
-          const tid = setTimeout(hopBack, 500);
-          st.recoveryTimers.push(tid);
-          setTime(anchor);
-        } else {
-          setTime(exactTarget - 0.3);
-        }
+        hopViaAnchor(exactTarget);
       } else {
-        // Last resort: the player may have left itself paused after the failed load.
-        setTime(exactTarget);
-        if (st.wasPlayingBeforeSeek && media.paused) {
-          const tid = setTimeout(() => {
+        hopViaAnchor(Math.max(minSeek, exactTarget - 1));
+        if (st.wasPlayingBeforeSeek) {
+          st.recoveryTimers.push(setTimeout(() => {
             if (media.isConnected && !seekSettled && media.paused && !userIsPressingKeys()) {
               media.play().catch(() => {});
             }
-          }, 150);
-          st.recoveryTimers.push(tid);
+          }, 900));
         }
       }
     };
@@ -514,16 +528,24 @@
       if (!media.isConnected || seekSettled) return;
       if (userIsPressingKeys()) return;
       if (isHealthy()) {
+        dbg("healthy, done", { cur: media.currentTime });
         completeCycle();
         return;
       }
       nudge();
     };
 
-    [900, 1900, 3200].forEach((ms) => {
-      st.recoveryTimers.push(setTimeout(checkStall, ms));
+    // Only the first 'seeked' in a fresh cycle is logged; completion is decided by checkStall (progress-based).
+    if (DEBUG) {
+      ["seeking", "seeked", "waiting", "stalled", "playing", "pause", "play", "error"].forEach((ev) =>
+        media.addEventListener(ev, () => dbg("ev", ev, media.currentTime.toFixed(2), "rs", media.readyState, "buf", bufStr(media)), { capture: true, once: true })
+      );
+    }
+
+    [700, 1500, 2500, 3800].forEach((ms) => {
+      st.recoveryTimers.push(setTimeout(() => { checkStall(); lastCheckTime = media.currentTime; }, ms));
     });
-    st.recoveryTimers.push(setTimeout(completeCycle, 5000));
+    st.recoveryTimers.push(setTimeout(completeCycle, 6000));
   }
 
   function seekMediaByDelta(media, deltaSeconds, isRepeatKey = false) {
