@@ -1,4 +1,4 @@
-// TempoSkip Background Service Worker (Manifest V3)
+// TempoSkip Background Service Worker (Manifest V3 - v1.2.0)
 
 const DEFAULT_SETTINGS = {
   enabled: true,
@@ -10,8 +10,7 @@ const DEFAULT_SETTINGS = {
   shiftMultiplierEnabled: true,
   shiftRewindSeconds: 15,     // Shift + Left Arrow skip duration (seconds)
   shiftForwardSeconds: 15,    // Shift + Right Arrow skip duration (seconds)
-  safeMseSeek: true,          // Prevent MSE/DRM freeze on out-of-buffer seeks (Crunchyroll, Shaka, HLS/DASH)
-  clampRewindToBuffer: false, // Optional: never rewind earlier than the start of the active buffer chunk
+  safeMseSeek: true,          // Coalesce rapid/unbuffered seeks & serialize in-flight MSE seeks without snapping
   enableSpeedHotkeys: true,   // '[' slower, ']' faster, '\\' reset speed
   speedStep: 0.25,            // Step size for '[' and ']' hotkeys
   showHud: true,              // Show sleek on-video HUD toast when speed/skip triggers

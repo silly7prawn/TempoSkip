@@ -1,4 +1,4 @@
-// TempoSkip Popup Controller (v1.1.0)
+// TempoSkip Popup Controller (v1.2.0)
 
 const DEFAULT_SETTINGS = {
   enabled: true,
@@ -11,7 +11,6 @@ const DEFAULT_SETTINGS = {
   shiftRewindSeconds: 15,
   shiftForwardSeconds: 15,
   safeMseSeek: true,
-  clampRewindToBuffer: false,
   enableSpeedHotkeys: true,
   speedStep: 0.25,
   showHud: true,
@@ -38,7 +37,6 @@ const els = {
   shiftForwardInput: document.getElementById("shiftForwardInput"),
   shiftSkipRow: document.getElementById("shiftSkipRow"),
   safeMseSeekToggle: document.getElementById("safeMseSeekToggle"),
-  clampRewindToBufferToggle: document.getElementById("clampRewindToBufferToggle"),
   speedHotkeysToggle: document.getElementById("speedHotkeysToggle"),
   showHudToggle: document.getElementById("showHudToggle"),
   resetDefaultsBtn: document.getElementById("resetDefaultsBtn")
@@ -106,7 +104,6 @@ function renderUI() {
   els.shiftSkipRow.style.opacity = currentSettings.shiftMultiplierEnabled ? "1" : "0.45";
 
   els.safeMseSeekToggle.checked = Boolean(currentSettings.safeMseSeek);
-  els.clampRewindToBufferToggle.checked = Boolean(currentSettings.clampRewindToBuffer);
   els.speedHotkeysToggle.checked = Boolean(currentSettings.enableSpeedHotkeys);
   els.showHudToggle.checked = Boolean(currentSettings.showHud);
 
@@ -232,10 +229,6 @@ els.shiftForwardInput.addEventListener("change", () => {
 
 els.safeMseSeekToggle.addEventListener("change", () => {
   savePatch({ safeMseSeek: els.safeMseSeekToggle.checked });
-});
-
-els.clampRewindToBufferToggle.addEventListener("change", () => {
-  savePatch({ clampRewindToBuffer: els.clampRewindToBufferToggle.checked });
 });
 
 els.speedHotkeysToggle.addEventListener("change", () => {

@@ -145,13 +145,9 @@
 
     <!-- Stream & Buffer Stability + Extra Controls -->
     <section class="card compact-card">
-      <label class="check-row" title="Coalesces unbuffered seeks, bridges MSE keyframe gaps, and recovers stalled streams on Crunchyroll/Shaka/HLS">
+      <label class="check-row" title="Coalesces rapid multi-clicks & serializes unbuffered MSE seeks without snapping">
         <input type="checkbox" id="safeMseSeekToggle" checked />
-        <span>Smart out-of-buffer seek protection (fixes Crunchyroll freezes)</span>
-      </label>
-      <label class="check-row" title="Prevents rewinding past the start of the currently loaded buffer chunk">
-        <input type="checkbox" id="clampRewindToBufferToggle" />
-        <span>Clamp rewinds to currently buffered chunk only</span>
+        <span>Serialize rapid &amp; unbuffered MSE seeks (Crunchyroll fix)</span>
       </label>
       <label class="check-row">
         <input type="checkbox" id="speedHotkeysToggle" checked />

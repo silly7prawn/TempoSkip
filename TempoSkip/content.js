@@ -1,6 +1,6 @@
-// TempoSkip Content Script (v1.1.0)
+// TempoSkip Content Script (v1.2.0)
 // Runs at document_start across all frames to override playback speeds and Left/Right arrow skip durations.
-// Includes Smart MSE/DRM Out-of-Buffer Seek Protection for players like Crunchyroll, Shaka, Bitmovin, and HLS/DASH.
+// Precision MSE seek engine: zero buffer snapping, serialized in-flight seeks, and pause-seek-play stall recovery.
 
 (() => {
   if (window.__tempoSkipInitialized) return;
@@ -8,7 +8,9 @@
 
   const MIN_SPEED = 0.07;
   const MAX_SPEED = 16.0;
-  const OUT_OF_BUFFER_DEBOUNCE_MS = 150;
+  const RAPID_CLICK_WINDOW_MS = 260;
+  const SEEK_COALESCE_DEBOUNCE_MS = 220;
+  const IN_FLIGHT_SEEK_TIMEOUT_MS = 900;
 
   let settings = {
     enabled: true,
@@ -21,7 +23,6 @@
     shiftRewindSeconds: 15,
     shiftForwardSeconds: 15,
     safeMseSeek: true,
-    clampRewindToBuffer: false,
     enableSpeedHotkeys: true,
     speedStep: 0.25,
     showHud: true,
@@ -29,7 +30,6 @@
   };
 
   const trackedMedia = new Set();
-  // Per-media state for coalescing rapid/out-of-buffer seeks and recovering from MSE stalls
   const mediaSeekState = new WeakMap();
 
   let lastActiveMedia = null;
@@ -42,23 +42,33 @@
     let st = mediaSeekState.get(media);
     if (!st) {
       st = {
-        pendingTargetTime: null,
-        accumulatedDelta: 0,
-        wasPlayingBeforeSeek: false,
-        debounceTimer: null,
-        recoveryTimers: [],
-        suspendRateEnforcement: false,
-        recoveryCleanup: null
+        cycleActive: false,          // True from first keypress until final seeked/canplay settles
+        virtualTargetTime: null,     // Exact accumulated target timestamp across rapid clicks
+        queuedTargetTime: null,      // Target waiting for an in-flight MSE seek (`media.seeking`) to finish
+        accumulatedDelta: 0,         // Total +/- seconds shown in the HUD for the current burst
+        wasPlayingBeforeSeek: false, // Preserved play state before the seek burst began
+        pausedByUs: false,           // Whether we paused the media during rapid unbuffered scrubbing
+        lastKeyTime: 0,              // Timestamp (performance.now) of the most recent skip keydown
+        debounceTimer: null,         // Coalescing timer for rapid/unbuffered clicks
+        inFlightWaitTimer: null,     // Fallback timer if `seeked` event is delayed while queuedTargetTime waits
+        hudResetTimer: null,         // Resets accumulatedDelta after user stops pressing keys
+        recoveryTimers: [],          // Post-seek stall detection timers
+        recoveryCleanup: null,       // Listener cleanup function
+        suspendRateEnforcement: false
       };
       mediaSeekState.set(media, st);
     }
     return st;
   }
 
-  function clearRecoveryTimers(st) {
+  function clearRecoveryWatchdog(st) {
     if (st.recoveryTimers && st.recoveryTimers.length) {
       st.recoveryTimers.forEach((id) => clearTimeout(id));
       st.recoveryTimers = [];
+    }
+    if (st.inFlightWaitTimer) {
+      clearTimeout(st.inFlightWaitTimer);
+      st.inFlightWaitTimer = null;
     }
     if (typeof st.recoveryCleanup === "function") {
       st.recoveryCleanup();
@@ -157,7 +167,6 @@
   function applySpeedToMedia(media, speed) {
     if (!media || !isSiteEnabled()) return;
     const st = getSeekState(media);
-    // Avoid forcing non-1x speed in the middle of an unbuffered MSE seek, which can deadlock DRM/MSE decoders
     if (st.suspendRateEnforcement) return;
 
     const target = clampSpeed(speed);
@@ -316,17 +325,15 @@
     return num.toFixed(2).replace(/0$/, "");
   }
 
-  // --- MSE Buffer Inspection & Out-of-Buffer Protection Helpers ---
+  // --- Precision MSE Seek & Serialization Engine (No Buffer Snapping) ---
 
-  // Check if a target timestamp is inside any currently buffered TimeRange (with a small margin)
-  function isTimeBuffered(media, timeSec, margin = 0.15) {
+  // Check if a target timestamp is inside any currently buffered TimeRange
+  function isTimeBuffered(media, timeSec) {
     try {
       const buf = media.buffered;
       if (!buf || buf.length === 0) return false;
       for (let i = 0; i < buf.length; i++) {
-        const start = buf.start(i);
-        const end = buf.end(i);
-        if (timeSec >= start - 0.05 && timeSec <= Math.max(start, end - margin)) {
+        if (timeSec >= buf.start(i) + 0.05 && timeSec <= buf.end(i) - 0.1) {
           return true;
         }
       }
@@ -334,260 +341,260 @@
     return false;
   }
 
-  // Find the buffered range containing or closest to currentTime
-  function getCurrentBufferedFloor(media, referenceTime) {
-    try {
-      const buf = media.buffered;
-      if (!buf || buf.length === 0) return null;
-      for (let i = 0; i < buf.length; i++) {
-        const start = buf.start(i);
-        const end = buf.end(i);
-        if (referenceTime >= start - 0.25 && referenceTime <= end + 0.5) {
-          // Leave a tiny 0.08s pad after chunk start so we don't hit an unbuffered boundary
-          return Math.min(referenceTime, start + 0.08);
-        }
-      }
-    } catch (_) {}
-    return null;
-  }
-
-  // Get safe [minSeek, maxSeek] bounds respecting media.seekable & avoiding MSE 0.000s PTS hole
-  function getSafeSeekBounds(media) {
+  function getSeekableBounds(media) {
     let minSeek = 0;
     let maxSeek = Number.isFinite(media.duration) && media.duration > 0 ? media.duration : Infinity;
-
     try {
       const seekable = media.seekable;
       if (seekable && seekable.length > 0) {
-        minSeek = seekable.start(0);
+        minSeek = Math.max(0, seekable.start(0));
         maxSeek = seekable.end(seekable.length - 1);
       }
     } catch (_) {}
-
-    // Many MSE streams (Crunchyroll, Shaka, HLS/DASH) have a first video keyframe PTS slightly > 0 (e.g. 0.042s).
-    // Seeking to exact 0.0 when 0.0 is unbuffered causes MSE to wait indefinitely for [0, 0.042).
-    if (minSeek <= 0.08) {
-      try {
-        const buf = media.buffered;
-        if (buf && buf.length > 0 && buf.start(0) > 0 && buf.start(0) < 0.5) {
-          minSeek = Math.max(minSeek, buf.start(0) + 0.02);
-        } else {
-          minSeek = Math.max(minSeek, 0.05);
-        }
-      } catch (_) {
-        minSeek = Math.max(minSeek, 0.05);
-      }
+    // Avoid exact 0.000s PTS hole on MSE streams where first frame starts at ~0.04s
+    if (minSeek < 0.05 && !isTimeBuffered(media, 0)) {
+      minSeek = 0.05;
     }
-
-    if (Number.isFinite(maxSeek) && maxSeek > minSeek + 0.2) {
+    if (Number.isFinite(maxSeek) && maxSeek > minSeek + 0.1) {
       maxSeek = maxSeek - 0.05;
     }
-
     return { minSeek, maxSeek };
   }
 
-  // If MSE appended a new segment starting slightly AFTER media.currentTime (keyframe gap),
-  // return the start of that buffered range so we can bridge the gap and unfreeze playback.
-  function findKeyframeGapTarget(media) {
-    try {
-      const cur = Number(media.currentTime) || 0;
-      const buf = media.buffered;
-      if (!buf || buf.length === 0) return null;
+  // Execute the actual `media.currentTime = exactTarget` mutation safely.
+  // Never snaps to buffer boundaries; serializes if `media.seeking` is currently active.
+  function executePrecisionSeek(media, exactTarget) {
+    const st = getSeekState(media);
+    clearRecoveryWatchdog(st);
 
-      // If cur is already comfortably inside a buffered range, no gap exists
-      for (let i = 0; i < buf.length; i++) {
-        if (cur >= buf.start(i) && cur < buf.end(i) - 0.05) {
-          return null;
+    // If the browser/MSE player is ALREADY in the middle of an unbuffered seek (`media.seeking === true`),
+    // do NOT overwrite `media.currentTime` mid-append (which corrupts Crunchyroll's MSE SourceBuffer).
+    // Queue `exactTarget` and fire it the instant the current `seeked` event completes.
+    if (settings.safeMseSeek && media.seeking) {
+      st.queuedTargetTime = exactTarget;
+      const onInFlightSeeked = () => {
+        media.removeEventListener("seeked", onInFlightSeeked, true);
+        if (st.inFlightWaitTimer) {
+          clearTimeout(st.inFlightWaitTimer);
+          st.inFlightWaitTimer = null;
         }
-      }
+        if (st.queuedTargetTime !== null && st.debounceTimer === null) {
+          const nextTarget = st.queuedTargetTime;
+          st.queuedTargetTime = null;
+          performRawSeekWithRecovery(media, nextTarget);
+        }
+      };
+      media.addEventListener("seeked", onInFlightSeeked, true);
+      st.inFlightWaitTimer = setTimeout(() => {
+        media.removeEventListener("seeked", onInFlightSeeked, true);
+        st.inFlightWaitTimer = null;
+        if (st.queuedTargetTime !== null && st.debounceTimer === null) {
+          const nextTarget = st.queuedTargetTime;
+          st.queuedTargetTime = null;
+          performRawSeekWithRecovery(media, nextTarget);
+        }
+      }, IN_FLIGHT_SEEK_TIMEOUT_MS);
+      return;
+    }
 
-      // Check if a buffered chunk starts slightly ahead of cur (within 3.5 seconds)
-      let closestStart = null;
-      let minDiff = Infinity;
-      for (let i = 0; i < buf.length; i++) {
-        const start = buf.start(i);
-        const end = buf.end(i);
-        const diff = start - cur;
-        if (diff > -0.02 && diff <= 3.5 && end - start > 0.15 && diff < minDiff) {
-          minDiff = diff;
-          closestStart = start;
-        }
-      }
-      if (closestStart !== null) {
-        return closestStart + 0.03;
-      }
-    } catch (_) {}
-    return null;
+    st.queuedTargetTime = null;
+    performRawSeekWithRecovery(media, exactTarget);
   }
 
-  // Commit the seek to the media element and run the MSE recovery watchdog if out of buffer
-  function commitSeek(media, targetTime, wasOutOfBuffer) {
+  function performRawSeekWithRecovery(media, exactTarget) {
     const st = getSeekState(media);
-    clearRecoveryTimers(st);
+    clearRecoveryWatchdog(st);
 
-    const wasPlaying = st.wasPlayingBeforeSeek;
-    st.pendingTargetTime = null;
-    st.accumulatedDelta = 0;
-    st.debounceTimer = null;
+    const targetIsBuffered = isTimeBuffered(media, exactTarget);
+    const shouldResumePlay = st.wasPlayingBeforeSeek;
 
-    if (!settings.safeMseSeek || !wasOutOfBuffer) {
-      // Fast path for in-buffer seeks
+    // Fast path when seeking inside an already-buffered range
+    if (!settings.safeMseSeek || targetIsBuffered) {
       try {
-        media.currentTime = targetTime;
+        media.currentTime = exactTarget;
       } catch (_) {}
-      if (wasPlaying && media.paused) {
+      st.virtualTargetTime = null;
+      st.cycleActive = false;
+      st.suspendRateEnforcement = false;
+      if (shouldResumePlay && media.paused) {
+        st.pausedByUs = false;
         media.play().catch(() => {});
+      }
+      if (isSiteEnabled()) {
+        applySpeedToMedia(media, settings.playbackSpeed);
       }
       return;
     }
 
-    // --- Safe Out-of-Buffer MSE Seek Path (Crunchyroll / Shaka / Bitmovin / HLS / DASH) ---
-    // 1. Temporarily suspend custom playbackRate forcing during unbuffered segment negotiation
+    // --- Out-of-Buffer Precision Seek Path (Crunchyroll / Shaka / HLS / DASH) ---
     st.suspendRateEnforcement = true;
+    let seekSettled = false;
+    let reseekWakeAttempted = false;
 
-    let lastObservedTime = targetTime;
-    let bridgedGapCount = 0;
-
-    const finishRecovery = () => {
-      clearRecoveryTimers(st);
+    const completeCycle = () => {
+      if (seekSettled) return;
+      seekSettled = true;
+      clearRecoveryWatchdog(st);
+      st.virtualTargetTime = null;
+      st.cycleActive = false;
       st.suspendRateEnforcement = false;
+      st.pausedByUs = false;
+
       if (isSiteEnabled()) {
         applySpeedToMedia(media, settings.playbackSpeed);
       }
-      if (wasPlaying && media.paused && media.readyState >= 2) {
+      if (shouldResumePlay && media.paused) {
         media.play().catch(() => {});
       }
     };
 
-    const attemptUnfreeze = () => {
-      if (!media.isConnected) {
-        clearRecoveryTimers(st);
+    const onSeekedOrCanPlay = () => {
+      // If user started pressing keys again, abort this recovery and let the new debounce handle it
+      if (st.debounceTimer !== null || st.queuedTargetTime !== null) return;
+      if (!media.seeking && media.readyState >= 3) {
+        completeCycle();
+      } else if (!media.seeking && shouldResumePlay && media.paused) {
+        media.play().catch(() => {});
+      }
+    };
+
+    media.addEventListener("seeked", onSeekedOrCanPlay, true);
+    media.addEventListener("canplay", onSeekedOrCanPlay, true);
+    media.addEventListener("playing", onSeekedOrCanPlay, true);
+
+    st.recoveryCleanup = () => {
+      media.removeEventListener("seeked", onSeekedOrCanPlay, true);
+      media.removeEventListener("canplay", onSeekedOrCanPlay, true);
+      media.removeEventListener("playing", onSeekedOrCanPlay, true);
+    };
+
+    // Issue the single exact seek
+    try {
+      media.currentTime = exactTarget;
+    } catch (_) {}
+
+    // Watchdog: If Crunchyroll's MSE controller gets stuck in `waiting`/`seeking` or paused with no playback
+    // after an unbuffered seek, perform a clean `pause() -> currentTime = exactTarget -> play()` wake cycle
+    // (the exact same sequence triggered when clicking a player-inbuilt seek button, while keeping exactTarget).
+    const checkStallAndWake = (stage) => {
+      if (!media.isConnected || seekSettled) return;
+      if (st.debounceTimer !== null || st.queuedTargetTime !== null) return;
+
+      // If readyState is healthy and media is playing normally, finish cycle
+      if (!media.seeking && media.readyState >= 3 && (!shouldResumePlay || !media.paused)) {
+        completeCycle();
         return;
       }
 
-      // A. Check if MSE buffered a chunk starting at an IDR keyframe slightly ahead of media.currentTime
-      const gapTarget = findKeyframeGapTarget(media);
-      if (gapTarget !== null && bridgedGapCount < 2) {
-        bridgedGapCount++;
+      // If the player is still stuck at stage >= 2 (~1100ms) and hasn't recovered:
+      if (stage >= 2 && !reseekWakeAttempted && (media.seeking || media.readyState < 3 || (shouldResumePlay && media.paused))) {
+        reseekWakeAttempted = true;
         try {
-          media.currentTime = gapTarget;
+          media.pause();
         } catch (_) {}
-      }
-
-      // B. If the target range IS now buffered and readyState >= 3, resume playback & speed
-      if (isTimeBuffered(media, media.currentTime, 0.05) && media.readyState >= 3) {
-        if (wasPlaying && media.paused) {
-          media.play().catch(() => {});
-        }
-        // Check if playback is actually advancing or if the MSE decoder is stalled on a frame
-        const nowTime = Number(media.currentTime) || 0;
-        if (wasPlaying && !media.paused && Math.abs(nowTime - lastObservedTime) < 0.001) {
-          // Micro-nudge by +0.04s to kick stalled MSE/EME pipeline
+        setTimeout(() => {
+          if (st.debounceTimer !== null) return;
           try {
-            media.currentTime = nowTime + 0.04;
+            // Re-assert exact target time to wake up the MSE segment loader (no buffer snapping)
+            media.currentTime = exactTarget;
           } catch (_) {}
-        }
-        lastObservedTime = Number(media.currentTime) || 0;
+          if (shouldResumePlay) {
+            setTimeout(() => {
+              if (st.debounceTimer === null && media.paused) {
+                media.play().catch(() => {});
+              }
+            }, 80);
+          }
+        }, 60);
+        return;
+      }
+
+      if (shouldResumePlay && media.paused && !media.seeking && media.readyState >= 2) {
+        media.play().catch(() => {});
       }
     };
 
-    const onCanPlayOrPlaying = () => {
-      if (media.readyState >= 3) {
-        finishRecovery();
-      }
-    };
-
-    const onProgressOrWaiting = () => {
-      attemptUnfreeze();
-    };
-
-    media.addEventListener("canplay", onCanPlayOrPlaying, true);
-    media.addEventListener("playing", onCanPlayOrPlaying, true);
-    media.addEventListener("progress", onProgressOrWaiting, true);
-    media.addEventListener("waiting", onProgressOrWaiting, true);
-    media.addEventListener("stalled", onProgressOrWaiting, true);
-
-    st.recoveryCleanup = () => {
-      media.removeEventListener("canplay", onCanPlayOrPlaying, true);
-      media.removeEventListener("playing", onCanPlayOrPlaying, true);
-      media.removeEventListener("progress", onProgressOrWaiting, true);
-      media.removeEventListener("waiting", onProgressOrWaiting, true);
-      media.removeEventListener("stalled", onProgressOrWaiting, true);
-    };
-
-    // Perform the single coalesced seek
-    try {
-      media.currentTime = targetTime;
-    } catch (_) {}
-
-    // Schedule staged recovery checks to bridge MSE keyframe gaps and unstick frozen pipelines
-    [220, 500, 950, 1600].forEach((delayMs) => {
-      const tid = setTimeout(attemptUnfreeze, delayMs);
+    [450, 1100, 2000].forEach((ms, idx) => {
+      const tid = setTimeout(() => checkStallAndWake(idx + 1), ms);
       st.recoveryTimers.push(tid);
     });
 
-    // Final safety cleanup after 2.6 seconds
-    const finalTid = setTimeout(finishRecovery, 2600);
+    const finalTid = setTimeout(completeCycle, 2900);
     st.recoveryTimers.push(finalTid);
   }
 
   function seekMediaByDelta(media, deltaSeconds, isRepeatKey = false) {
     if (!media) return;
     const st = getSeekState(media);
+    const now = performance.now();
+    const isRapidBurst = now - st.lastKeyTime < RAPID_CLICK_WINDOW_MS;
+    st.lastKeyTime = now;
 
-    // Record whether the video was playing before a burst of seeks started
-    if (st.pendingTargetTime === null && st.debounceTimer === null) {
+    // Start a new seek cycle if one is not already active
+    if (!st.cycleActive) {
+      st.cycleActive = true;
       st.wasPlayingBeforeSeek = !media.paused && !media.ended;
+      st.virtualTargetTime = Number(media.currentTime) || 0;
+    }
+
+    // Reset HUD delta counter only if enough time elapsed since the last keypress
+    if (st.hudResetTimer) {
+      clearTimeout(st.hudResetTimer);
+    }
+    st.hudResetTimer = setTimeout(() => {
       st.accumulatedDelta = 0;
-    }
+      st.hudResetTimer = null;
+    }, 950);
 
-    const baseTime = st.pendingTargetTime !== null ? st.pendingTargetTime : (Number(media.currentTime) || 0);
-    const { minSeek, maxSeek } = getSafeSeekBounds(media);
-    let targetTime = Math.min(maxSeek, Math.max(minSeek, baseTime + deltaSeconds));
+    const baseTime =
+      st.virtualTargetTime !== null ? st.virtualTargetTime : (Number(media.currentTime) || 0);
+    const { minSeek, maxSeek } = getSeekableBounds(media);
+    const targetTime = Math.min(maxSeek, Math.max(minSeek, baseTime + deltaSeconds));
 
-    // Optional strict mode: clamp backward rewinds to the start of the active buffered chunk
-    let clampedToBuffer = false;
-    if (deltaSeconds < 0 && settings.clampRewindToBuffer) {
-      const floor = getCurrentBufferedFloor(media, Number(media.currentTime) || 0);
-      if (floor !== null && targetTime < floor) {
-        targetTime = floor;
-        clampedToBuffer = true;
-      }
-    }
-
-    st.pendingTargetTime = targetTime;
+    st.virtualTargetTime = targetTime;
     st.accumulatedDelta += deltaSeconds;
 
     const totalDelta = st.accumulatedDelta;
     const sign = totalDelta >= 0 ? "+" : "-";
     const icon = totalDelta >= 0 ? "⏩" : "⏪";
-    const bufferNote = clampedToBuffer ? " (buffered limit)" : "";
-    showHudToast(`${icon} ${sign}${formatNumber(Math.abs(totalDelta))}s${bufferNote}`, media);
+    showHudToast(`${icon} ${sign}${formatNumber(Math.abs(totalDelta))}s`, media);
 
     const targetIsBuffered = isTimeBuffered(media, targetTime);
 
-    // If Safe MSE Seek is enabled and:
-    // - the target timestamp is outside the currently buffered chunk, OR
-    // - the player is already mid-seek (`media.seeking`), OR
-    // - the user is holding down the arrow key (`isRepeatKey`) or already debouncing,
-    // coalesce rapid presses into a single clean seek so the MSE SourceBuffer never thrashes or freezes.
+    // Coalesce when Safe MSE Seek is enabled and:
+    // 1. Target is outside `media.buffered`, OR
+    // 2. User is clicking rapidly (`isRapidBurst` or `isRepeatKey`), OR
+    // 3. Player is currently mid-seek (`media.seeking`), OR
+    // 4. A debounce timer is already running for this burst.
     if (
       settings.safeMseSeek &&
-      (!targetIsBuffered || media.seeking || isRepeatKey || st.debounceTimer !== null)
+      (!targetIsBuffered || isRapidBurst || isRepeatKey || media.seeking || st.debounceTimer !== null)
     ) {
+      // Cancel any post-seek recovery from a prior seek while the user is still clicking
+      clearRecoveryWatchdog(st);
+
+      // Pause active playback during rapid unbuffered scrubbing so Crunchyroll's MSE decoder
+      // doesn't fight in-flight frame decoding while the user is still tapping arrow keys.
+      if (!targetIsBuffered && st.wasPlayingBeforeSeek && !media.paused) {
+        st.pausedByUs = true;
+        try {
+          media.pause();
+        } catch (_) {}
+      }
+
       if (st.debounceTimer) {
         clearTimeout(st.debounceTimer);
       }
       st.debounceTimer = setTimeout(() => {
-        const finalTarget = st.pendingTargetTime !== null ? st.pendingTargetTime : targetTime;
-        const stillOutOfBuffer = !isTimeBuffered(media, finalTarget);
-        commitSeek(media, finalTarget, stillOutOfBuffer);
-      }, OUT_OF_BUFFER_DEBOUNCE_MS);
+        st.debounceTimer = null;
+        const finalTarget = st.virtualTargetTime !== null ? st.virtualTargetTime : targetTime;
+        executePrecisionSeek(media, finalTarget);
+      }, SEEK_COALESCE_DEBOUNCE_MS);
       return;
     }
 
-    // Immediate seek when target is safely inside the existing buffer
-    commitSeek(media, targetTime, false);
+    // Single click inside buffered range: execute immediately with zero delay
+    executePrecisionSeek(media, targetTime);
   }
 
   // --- Capture-Phase Keyboard Interception ---
