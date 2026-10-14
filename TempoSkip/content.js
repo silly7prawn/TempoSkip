@@ -1,4 +1,4 @@
-// TempoSkip Content Script (v1.3.2)
+// TempoSkip Content Script (v1.3.3)
 // Runs at document_start across all frames to override playback speeds and Left/Right arrow skip durations.
 // Precision MSE seek engine: zero buffer snapping, serialized in-flight seeks, and pause-seek-play stall recovery.
 

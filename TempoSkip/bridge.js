@@ -1,4 +1,4 @@
-// TempoSkip MAIN-world bridge (v1.3.2)
+// TempoSkip MAIN-world bridge (v1.3.3)
 // Runs in the PAGE's JS world (not the isolated content-script world) so it can reach the web player's
 // own controller object and call its native seek API. Some players (Crunchyroll) run their MSE engine
 // behind a message boundary and only re-target their segment loader when seeks go through that API; a raw
@@ -13,7 +13,7 @@
   if (window.__tempoSkipBridge) return;
   window.__tempoSkipBridge = true;
 
-  const SEEK_NAMES = /^(seekToTimelineTime|seekTo|seek|seekToTime|setCurrentTime)$/i;
+  const SEEK_NAMES = /^(seek\w*ToTimelineTime|seekTo|seek|seekToTime|setCurrentTime)$/i;
   const CLOCK_NAMES = /^(currentTime|timelineTime|currentTimelineTime|playhead|position|currentPosition|playheadTime)$/i;
   const CLOCK_GETTERS = /^(getCurrentTime|getTimelineTime|getCurrentTimelineTime|getPosition|getPlayhead|getPlayheadTime|currentTime)$/i;
   const MAX_NODES = 25000;
@@ -112,27 +112,57 @@
 
   // Some players (Crunchyroll "katamari") keep media/stream time and timeline time separate and expose a
   // converter next to the orchestrator, e.g. orchestrator._playerTime.streamTimeToTimelineTime(t).
-  function findConverter(owner) {
+  const CONV_RE = /^([a-z]\w*?)TimeToTimelineTime$/i;
+  const CONV_RANK = ["stream", "media", "video", "element", "presentation", "player", "current"]; // earlier = more likely video.currentTime's domain
+
+  function convRank(domain) {
+    const i = CONV_RANK.indexOf(domain.toLowerCase());
+    return i === -1 ? (/^content$/i.test(domain) ? 99 : 50) : i;
+  }
+
+  // Generic "<x>TimeToTimelineTime" converters sitting on (or one level below) the seek owner,
+  // e.g. orchestrator._playerTime.streamTimeToTimelineTime(t). Picks the one whose input domain is most
+  // likely video.currentTime, and when an inverse timelineTimeTo<X>Time exists, requires a clean round trip.
+  function findConverter(owner, video) {
+    const holders = [owner];
     for (const k of methodNames(owner)) {
       const v = safeGet(owner, k);
-      if (v && typeof v === "object" && typeof safeGet(v, "streamTimeToTimelineTime") === "function") {
-        return { thisObj: v, fn: safeGet(v, "streamTimeToTimelineTime"), via: k + ".streamTimeToTimelineTime" };
+      if (v && typeof v === "object" && !isDom(v)) holders.push(v);
+    }
+    const all = [];
+    for (const h of holders) {
+      for (const n of methodNames(h)) {
+        const m = CONV_RE.exec(n);
+        if (!m || typeof safeGet(h, n) !== "function") continue;
+        const fn = safeGet(h, n);
+        const domain = m[1];
+        const invName = Object.keys(Object.getPrototypeOf(h) || {}).concat(methodNames(h)).find((x) => x.toLowerCase() === ("timelineTimeTo" + domain + "Time").toLowerCase());
+        const inv = invName && typeof safeGet(h, invName) === "function" ? safeGet(h, invName) : null;
+        all.push({ thisObj: h, fn, domain, inv, via: n, rank: convRank(domain) });
       }
+    }
+    all.sort((x, y) => x.rank - y.rank);
+    for (const c of all) {
+      try {
+        const ct = video.currentTime;
+        const tl = c.fn.call(c.thisObj, ct);
+        if (typeof tl !== "number" || !Number.isFinite(tl)) continue;
+        if (c.inv) {
+          const back = c.inv.call(c.thisObj, tl);
+          if (typeof back !== "number" || Math.abs(back - ct) > 0.05) continue; // not a clean round trip
+        }
+        c.sample = tl;
+        c.alternatives = all.filter((o) => o !== c).map((o) => o.via);
+        return c;
+      } catch (_) {}
     }
     return null;
   }
 
   // Work out how the player's clock relates to video.currentTime: timeline = a * currentTime + b
   function calibrate(owner, video) {
-    const conv = findConverter(owner);
-    if (conv) {
-      try {
-        const sample = conv.fn.call(conv.thisObj, video.currentTime);
-        if (typeof sample === "number" && Number.isFinite(sample)) {
-          return { mode: "convert", conv, via: conv.via, sample, a: 1, b: 0 };
-        }
-      } catch (_) {}
-    }
+    const conv = findConverter(owner, video);
+    if (conv) return { mode: "convert", conv, via: conv.via, sample: conv.sample, alternatives: conv.alternatives, a: 1, b: 0 };
     const ct = video.currentTime;
     const probes = [];
     const tryVal = (label, v) => {
@@ -161,13 +191,14 @@
     let best = null;
     for (const c of found) {
       const cal = calibrate(c.owner, video);
-      const entry = { path: c.path, seekNames: c.seekNames, calibrated: cal.a !== null, mode: cal.mode, via: cal.via, units: cal.a, sample: cal.sample, probes: cal.probes };
+      const entry = { path: c.path, seekNames: c.seekNames, calibrated: cal.a !== null, mode: cal.mode, via: cal.via, units: cal.a, sample: cal.sample, alternatives: cal.alternatives, probes: cal.probes };
       report.candidates.push(entry);
       if (cal.a === null) continue;
       // Prefer seekToTimelineTime, then seekTo, then seek.
       const pref = ["seektotimelinetime", "seekto", "seek", "seektotime", "setcurrenttime"];
-      const name = c.seekNames.slice().sort((x, y) => pref.indexOf(x.toLowerCase()) - pref.indexOf(y.toLowerCase()))[0];
-      const rank = pref.indexOf(name.toLowerCase());
+      const rankOf = (n) => { const i = pref.indexOf(n.toLowerCase()); return i === -1 ? (/ToTimelineTime$/i.test(n) ? 0 : 9) : i; };
+      const name = c.seekNames.slice().sort((x, y) => rankOf(x) - rankOf(y))[0];
+      const rank = rankOf(name);
       if (!best || rank < best.rank) best = { owner: c.owner, name, rank, clock: cal, path: c.path };
     }
     report.chosen = best ? { path: best.path, fn: best.name, mode: best.clock.mode, via: best.clock.via } : null;
