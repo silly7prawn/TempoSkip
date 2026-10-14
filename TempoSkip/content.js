@@ -1,4 +1,4 @@
-// TempoSkip Content Script (v1.3.1)
+// TempoSkip Content Script (v1.3.2)
 // Runs at document_start across all frames to override playback speeds and Left/Right arrow skip durations.
 // Precision MSE seek engine: zero buffer snapping, serialized in-flight seeks, and pause-seek-play stall recovery.
 
@@ -640,6 +640,31 @@
     } else {
       setTime(exactTarget);
     }
+
+    // Seek to a known-buffered anchor (this revives the player: buffered seeks always work),
+    // then seek to the real target again once that settles.
+    const hopViaAnchor = (finalTarget) => {
+      const anchor = origin;
+      if (!isTimeBuffered(media, anchor) || Math.abs(anchor - finalTarget) < 0.5) {
+        setTime(finalTarget);
+        return;
+      }
+      let done = false;
+      const next = () => {
+        if (done) return;
+        done = true;
+        media.removeEventListener("seeked", next, true);
+        if (!media.isConnected || seekSettled || userIsPressingKeys()) return;
+        setTimeout(() => {
+          if (!media.isConnected || seekSettled || userIsPressingKeys()) return;
+          setTime(finalTarget);
+          lastCheckTime = finalTarget;
+        }, 120);
+      };
+      media.addEventListener("seeked", next, true);
+      st.recoveryTimers.push(setTimeout(next, 600));
+      setTime(anchor);
+    };
 
     const nudge = () => {
       nudgeStage++;

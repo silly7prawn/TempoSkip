@@ -1,4 +1,4 @@
-// TempoSkip MAIN-world bridge (v1.3.0)
+// TempoSkip MAIN-world bridge (v1.3.2)
 // Runs in the PAGE's JS world (not the isolated content-script world) so it can reach the web player's
 // own controller object and call its native seek API. Some players (Crunchyroll) run their MSE engine
 // behind a message boundary and only re-target their segment loader when seeks go through that API; a raw
@@ -110,8 +110,29 @@
     return { found, nodes, near };
   }
 
+  // Some players (Crunchyroll "katamari") keep media/stream time and timeline time separate and expose a
+  // converter next to the orchestrator, e.g. orchestrator._playerTime.streamTimeToTimelineTime(t).
+  function findConverter(owner) {
+    for (const k of methodNames(owner)) {
+      const v = safeGet(owner, k);
+      if (v && typeof v === "object" && typeof safeGet(v, "streamTimeToTimelineTime") === "function") {
+        return { thisObj: v, fn: safeGet(v, "streamTimeToTimelineTime"), via: k + ".streamTimeToTimelineTime" };
+      }
+    }
+    return null;
+  }
+
   // Work out how the player's clock relates to video.currentTime: timeline = a * currentTime + b
   function calibrate(owner, video) {
+    const conv = findConverter(owner);
+    if (conv) {
+      try {
+        const sample = conv.fn.call(conv.thisObj, video.currentTime);
+        if (typeof sample === "number" && Number.isFinite(sample)) {
+          return { mode: "convert", conv, via: conv.via, sample, a: 1, b: 0 };
+        }
+      } catch (_) {}
+    }
     const ct = video.currentTime;
     const probes = [];
     const tryVal = (label, v) => {
@@ -128,7 +149,7 @@
       for (const a of [1, 1000]) {
         const b = pr.v - a * ct;
         // Accept only a clean mapping: offset must be tiny compared to the unit (clock moves in real time).
-        if (Math.abs(b) <= (a === 1 ? 2 : 2000)) return { a, b, via: pr.label };
+        if (Math.abs(b) <= (a === 1 ? 2 : 2000)) return { mode: "clock", a, b, via: pr.label };
       }
     }
     return { a: null, b: null, via: null, probes: probes.map((p) => p.label + "=" + p.v) };
@@ -140,7 +161,7 @@
     let best = null;
     for (const c of found) {
       const cal = calibrate(c.owner, video);
-      const entry = { path: c.path, seekNames: c.seekNames, calibrated: cal.a !== null, via: cal.via, units: cal.a, probes: cal.probes };
+      const entry = { path: c.path, seekNames: c.seekNames, calibrated: cal.a !== null, mode: cal.mode, via: cal.via, units: cal.a, sample: cal.sample, probes: cal.probes };
       report.candidates.push(entry);
       if (cal.a === null) continue;
       // Prefer seekToTimelineTime, then seekTo, then seek.
@@ -149,7 +170,7 @@
       const rank = pref.indexOf(name.toLowerCase());
       if (!best || rank < best.rank) best = { owner: c.owner, name, rank, clock: cal, path: c.path };
     }
-    report.chosen = best ? { path: best.path, fn: best.name, units: best.clock.a } : null;
+    report.chosen = best ? { path: best.path, fn: best.name, mode: best.clock.mode, via: best.clock.via } : null;
     return { best, report };
   }
 
@@ -174,10 +195,14 @@
     // Re-calibrate every call: the offset is cheap to measure and guards against drift / ads.
     const cal = calibrate(c.owner, video);
     if (cal.a === null) return { ok: false, reason: "clock lost" };
-    const arg = cal.a * t + cal.b;
+    let arg = cal.a * t + cal.b;
+    if (cal.mode === "convert") {
+      try { arg = cal.conv.fn.call(cal.conv.thisObj, t); } catch (e) { return { ok: false, reason: "convert threw: " + (e && e.message) }; }
+      if (typeof arg !== "number" || !Number.isFinite(arg)) return { ok: false, reason: "converter returned " + String(arg) };
+    }
     try {
       c.owner[c.name](arg);
-      return { ok: true, via: c.path + "." + c.name + "(" + arg.toFixed(2) + ")" };
+      return { ok: true, via: c.path + "." + c.name + "(" + arg.toFixed(2) + ") [" + cal.mode + "]" };
     } catch (e) {
       return { ok: false, reason: "seek threw: " + (e && e.message) };
     }
