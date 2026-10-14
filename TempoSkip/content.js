@@ -1,4 +1,4 @@
-// TempoSkip Content Script (v1.4.0)
+// TempoSkip Content Script (v1.4.2)
 // Runs at document_start across all frames to override playback speeds and Left/Right arrow skip durations.
 // Precision MSE seek engine: zero buffer snapping, serialized in-flight seeks, and pause-seek-play stall recovery.
 
@@ -439,7 +439,8 @@
         if (chrome.runtime.lastError) return;
         const all = (r && r.siteProfiles) || {};
         const cur = all[HOST_KEY] || {};
-        const next = { ...cur, ...patch, ts: Date.now() };
+        const p = typeof patch === "function" ? patch(cur) : patch;
+        const next = { ...cur, ...p, ts: Date.now() };
         if (JSON.stringify({ ...cur, ts: 0 }) === JSON.stringify({ ...next, ts: 0 })) return; // nothing new
         all[HOST_KEY] = next;
         siteProfiles = all;
@@ -622,71 +623,88 @@
       startWatchdog();
     };
 
-    // Fallback chain for backward unbuffered seeks: player's own jump-back button, then a raw seek.
-    const runFallback = () => {
+    // ---- Strategy for unbuffered targets (either direction) ----
+    // "auto": plain seek first. Only if the player really hangs (stalled AND its buffer stopped growing)
+    //         do we seek through the player's own API, and we remember per site + direction that it needs that.
+    // "api" : API first.   "raw": never touch the player's API.   (per-site override in the popup)
+    const dirKey = goingBack ? "back" : "fwd";
+    const profNow = () => siteProfiles[HOST_KEY] || null;
+    const siteMode = () => (profNow() && profNow().mode) || "auto";
+    let lastBuf = bufStr(media);
+    let apiTried = false;
+    let recovering = false;
+
+    // Seek through the page-world bridge (player's own controller API) and verify the video actually lands.
+    const attemptBridge = (onLanded, onFailed) => {
+      const prof = profNow();
+      const mode = siteMode();
+      const knownNone = prof && prof.bridge === "none" && Date.now() - (prof.ts || 0) < NEG_TTL_MS;
+      if (mode === "raw" || (knownNone && mode !== "api")) {
+        dbg("player API skipped:", mode === "raw" ? "site set to plain seeks" : "cached: no API on this site");
+        onFailed("skipped");
+        return;
+      }
+      const token = (st.nativeToken = (st.nativeToken || 0) + 1);
+      const hint = prof && prof.bridge === "ok" && prof.path && prof.fn ? { path: prof.path, fn: prof.fn } : null;
+      bridgeSeek(exactTarget, hint).then((res) => {
+        if (seekSettled || token !== st.nativeToken) return;
+        if (!res.ok) {
+          dbg("bridge unavailable:", res.reason);
+          if (/^no calibrated seek API/.test(res.reason || "")) updateSiteProfile({ bridge: "none", path: null, fn: null, via: null });
+          onFailed(res.reason);
+          return;
+        }
+        dbg("bridge seek issued:", res.via);
+        const t0 = performance.now();
+        const verify = () => {
+          if (seekSettled || token !== st.nativeToken || !media.isConnected) return;
+          if (!media.seeking && media.readyState >= 3 && Math.abs(media.currentTime - exactTarget) < 1.5) {
+            dbg("bridge seek landed", { cur: media.currentTime });
+            const p = res.profile || {};
+            updateSiteProfile({ bridge: "ok", path: p.path, fn: p.fn, via: p.via, fail: 0 });
+            onLanded(res);
+            return;
+          }
+          if (performance.now() - t0 > 3000) {
+            dbg("bridge seek did not land", { cur: media.currentTime, seeking: media.seeking, rs: media.readyState });
+            const fails = ((profNow() && profNow().fail) || 0) + 1;
+            updateSiteProfile(fails >= 3 ? { bridge: "none", fail: fails } : { fail: fails }); // stop trusting it for a while
+            onFailed("did not land");
+            return;
+          }
+          setTimeout(verify, 100);
+        };
+        setTimeout(verify, 150);
+      });
+    };
+
+    // Legacy fallback when the API isn't usable: player's jump-back button (backward only), else a plain seek.
+    const plainOrButton = () => {
       if (seekSettled) return;
-      if (findNativeJumpButton(media, -1)) {
+      if (goingBack && siteMode() !== "raw" && findNativeJumpButton(media, -1)) {
         nativeAssistedBackSeek(
           media,
           exactTarget,
           st,
           () => { updateSiteProfile({ fallback: "button" }); lastCheckTime = exactTarget; beginWatchdog(); },
-          (why) => { dbg("native assist failed -> raw seek:", why); updateSiteProfile({ fallback: "raw" }); setTime(exactTarget); lastCheckTime = exactTarget; beginWatchdog(); }
+          (why) => { dbg("native assist failed -> plain seek:", why); updateSiteProfile({ fallback: "raw" }); setTime(exactTarget); lastCheckTime = exactTarget; beginWatchdog(); }
         );
       } else {
-        dbg("no native jump-back button found; using raw seek");
         setTime(exactTarget);
         lastCheckTime = exactTarget;
         beginWatchdog();
       }
     };
 
-    if (goingBack) {
-      // 1) Ask the MAIN-world bridge to seek through the player's own controller API
-      //    (using this site's learned profile as a hint, and skipping the search where it found nothing recently).
-      const token = (st.nativeToken = (st.nativeToken || 0) + 1);
-      const prof = siteProfiles[HOST_KEY] || null;
-      const knownNone = prof && prof.bridge === "none" && Date.now() - (prof.ts || 0) < NEG_TTL_MS;
-      if (knownNone) {
-        dbg("site profile: no player API here (cached) -> skipping bridge");
-        runFallback();
-      } else {
-        const hint = prof && prof.bridge === "ok" && prof.path && prof.fn ? { path: prof.path, fn: prof.fn } : null;
-        bridgeSeek(exactTarget, hint).then((res) => {
-          if (seekSettled || token !== st.nativeToken) return;
-          if (!res.ok) {
-            dbg("bridge unavailable:", res.reason);
-            if (/^no calibrated seek API/.test(res.reason || "")) updateSiteProfile({ bridge: "none", path: null, fn: null, via: null });
-            runFallback();
-            return;
-          }
-          dbg("bridge seek issued:", res.via);
-          const t0 = performance.now();
-          const verify = () => {
-            if (seekSettled || token !== st.nativeToken || !media.isConnected) return;
-            if (!media.seeking && media.readyState >= 3 && Math.abs(media.currentTime - exactTarget) < 1.5) {
-              dbg("bridge seek landed", { cur: media.currentTime });
-              const p = res.profile || {};
-              updateSiteProfile({ bridge: "ok", path: p.path, fn: p.fn, via: p.via, fail: 0 });
-              lastCheckTime = media.currentTime;
-              beginWatchdog();
-              return;
-            }
-            if (performance.now() - t0 > 3000) {
-              dbg("bridge seek did not land -> fallback", { cur: media.currentTime, seeking: media.seeking, rs: media.readyState });
-              const fails = ((prof && prof.fail) || 0) + 1;
-              // After repeated failures stop trusting the API on this site for a while.
-              updateSiteProfile(fails >= 3 ? { bridge: "none", fail: fails } : { fail: fails });
-              runFallback();
-              return;
-            }
-            setTimeout(verify, 100);
-          };
-          setTimeout(verify, 150);
-        });
-      }
+    // needsApi is one flag per site (older saved profiles stored {back, fwd}: either one counts).
+    const needsApiLearned = (p) => !!p && (p.needsApi === true || (!!p.needsApi && typeof p.needsApi === "object" && Object.values(p.needsApi).some(Boolean)));
+    const prefersApi = siteMode() === "api" || needsApiLearned(profNow());
+    if (prefersApi) {
+      apiTried = true;
+      dbg("learned/forced: this site needs the player API for unbuffered seeks");
+      attemptBridge(() => { lastCheckTime = media.currentTime; beginWatchdog(); }, plainOrButton);
     } else {
-      setTime(exactTarget);
+      setTime(exactTarget); // plain seek first
     }
 
     // Seek to a known-buffered anchor (this revives the player: buffered seeks always work),
@@ -739,10 +757,44 @@
 
     const checkStall = () => {
       if (!media.isConnected || seekSettled) return;
-      if (userIsPressingKeys()) return;
+      if (userIsPressingKeys() || recovering) return;
       if (isHealthy()) {
         dbg("healthy, done", { cur: media.currentTime });
         completeCycle();
+        return;
+      }
+      // Is data still arriving? Then it's a slow load, not a hang: leave it alone.
+      const nowBuf = bufStr(media);
+      const flowing = nowBuf !== lastBuf;
+      lastBuf = nowBuf;
+      if (flowing) {
+        dbg("slow load (buffer still growing) - waiting", { buffered: nowBuf });
+        return;
+      }
+      // Real hang. First try the player's own API once, then remember that this site needs it.
+      if (!apiTried && siteMode() !== "raw") {
+        apiTried = true;
+        recovering = true;
+        dbg("hang detected (stalled, buffer not growing) -> trying player API", { dir: dirKey });
+        attemptBridge(
+          (res) => {
+            recovering = false;
+            const p = (res && res.profile) || {};
+            updateSiteProfile({ bridge: "ok", path: p.path, fn: p.fn, via: p.via, fail: 0, needsApi: true });
+            lastCheckTime = media.currentTime;
+          },
+          () => {
+            if (goingBack && siteMode() !== "raw" && findNativeJumpButton(media, -1)) {
+              nativeAssistedBackSeek(
+                media, exactTarget, st,
+                () => { recovering = false; updateSiteProfile({ fallback: "button" }); lastCheckTime = media.currentTime; },
+                () => { recovering = false; }
+              );
+            } else {
+              recovering = false;
+            }
+          }
+        );
         return;
       }
       nudge();
@@ -761,8 +813,8 @@
       });
       st.recoveryTimers.push(setTimeout(completeCycle, 6000));
     };
-    // Raw path starts watching immediately; native-assisted path starts once its final seek is issued.
-    if (!goingBack) beginWatchdog();
+    // Plain-seek path starts watching immediately; the API-first path starts once its seek has landed.
+    if (!prefersApi) beginWatchdog();
     st.recoveryTimers.push(setTimeout(completeCycle, 15000));
   }
 

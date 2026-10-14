@@ -267,7 +267,26 @@ function renderLearned(profiles) {
     name.title = p.path ? p.path + "." + p.fn : "";
     const tag = document.createElement("span");
     tag.className = "tag" + (p.bridge === "ok" ? " ok" : "");
-    tag.textContent = p.bridge === "ok" ? "player API" : "fallback: " + (p.fallback || "raw");
+    const needs = !!p.needsApi && (p.needsApi === true || Object.values(p.needsApi).some(Boolean));
+    tag.textContent = p.bridge === "ok" ? (needs ? "API needed" : "API ready") : "plain seeks" + (p.fallback ? " (" + p.fallback + ")" : "");
+    tag.title = "API needed = a plain seek hung here, so out-of-buffer seeks go through the player's own API.";
+    const sel = document.createElement("select");
+    sel.className = "mode-sel";
+    sel.title = "How to seek on this site";
+    for (const [val, label] of [["auto", "Auto"], ["api", "API first"], ["raw", "Plain only"]]) {
+      const o = document.createElement("option");
+      o.value = val;
+      o.textContent = label;
+      if ((p.mode || "auto") === val) o.selected = true;
+      sel.appendChild(o);
+    }
+    sel.addEventListener("change", () => {
+      chrome.storage.local.get("siteProfiles", (r) => {
+        const all = (r && r.siteProfiles) || {};
+        all[host] = { ...(all[host] || {}), mode: sel.value, ts: Date.now() };
+        chrome.storage.local.set({ siteProfiles: all });
+      });
+    });
     const del = document.createElement("button");
     del.type = "button";
     del.className = "del";
@@ -280,7 +299,7 @@ function renderLearned(profiles) {
         chrome.storage.local.set({ siteProfiles: all }, () => renderLearned(all));
       });
     });
-    row.append(name, tag, del);
+    row.append(name, tag, sel, del);
     list.appendChild(row);
   }
 }

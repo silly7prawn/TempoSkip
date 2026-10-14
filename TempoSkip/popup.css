@@ -410,11 +410,12 @@ kbd {
 .learned-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
 .link-btn { background: none; border: none; color: #94a3b8; font-size: 11px; cursor: pointer; padding: 0; text-decoration: underline; }
 .link-btn:hover { color: #f8fafc; }
-.learned-list { display: flex; flex-direction: column; gap: 4px; max-height: 120px; overflow-y: auto; }
-.learned-row { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: #cbd5e1; }
-.learned-row .host { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.learned-row .tag { font-size: 10px; padding: 1px 6px; border-radius: 999px; border: 1px solid #334155; color: #94a3b8; }
+.learned-list { display: flex; flex-direction: column; gap: 8px; max-height: 150px; overflow-y: auto; }
+.learned-row { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; font-size: 11.5px; color: #cbd5e1; }
+.learned-row .host { flex: 1 1 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.learned-row .tag { margin-right: auto; font-size: 10px; padding: 1px 6px; border-radius: 999px; border: 1px solid #334155; color: #94a3b8; }
 .learned-row .tag.ok { border-color: #22c55e66; color: #86efac; }
 .learned-row .del { background: none; border: none; color: #64748b; cursor: pointer; font-size: 13px; line-height: 1; padding: 0 2px; }
 .learned-row .del:hover { color: #f87171; }
 .learned-empty { font-size: 11px; color: #64748b; }
+.learned-row .mode-sel { background: #0f172a; color: #cbd5e1; border: 1px solid #334155; border-radius: 6px; font-size: 10.5px; padding: 1px 2px; }
