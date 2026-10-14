@@ -265,30 +265,35 @@ function renderLearned(profiles) {
     name.className = "host";
     name.textContent = host;
     name.title = p.path ? p.path + "." + p.fn : "";
+    const hasApi = p.bridge === "ok";
     const tag = document.createElement("span");
-    tag.className = "tag" + (p.bridge === "ok" ? " ok" : "");
+    tag.className = "tag" + (hasApi ? " ok" : "");
+    tag.textContent = hasApi ? "player API" : "no API found";
+    tag.title = hasApi
+      ? "A plain seek hung on this site and the player's own seek API fixed it."
+      : "A seek hung here but no usable player API was found. Retried automatically after a few hours.";
+    // A seek-mode choice only means something where an API exists.
     const needs = !!p.needsApi && (p.needsApi === true || Object.values(p.needsApi).some(Boolean));
-    tag.textContent = p.bridge === "ok" ? (needs ? "API needed" : "API ready") : "plain seeks" + (p.fallback ? " (" + p.fallback + ")" : "");
-    tag.title = "API needed = a plain seek hung here, so out-of-buffer seeks go through the player's own API.";
-    const sel = document.createElement("select");
-    sel.className = "mode-sel";
-    sel.title = needs
-      ? "API first: out-of-buffer seeks here go through the player's own API. Plain only: never use the player's API on this site."
-      : "Plain first: a normal seek is tried first; the player's API is only used if the player hangs. Plain only: never use the player's API on this site.";
-    for (const [val, label] of [["auto", needs ? "API first" : "Plain first"], ["raw", "Plain only"]]) {
-      const o = document.createElement("option");
-      o.value = val;
-      o.textContent = label;
-      if ((p.mode === "raw" ? "raw" : "auto") === val) o.selected = true;
-      sel.appendChild(o);
-    }
-    sel.addEventListener("change", () => {
-      chrome.storage.local.get("siteProfiles", (r) => {
-        const all = (r && r.siteProfiles) || {};
-        all[host] = { ...(all[host] || {}), mode: sel.value, ts: Date.now() };
-        chrome.storage.local.set({ siteProfiles: all });
+    let sel = null;
+    if (hasApi) {
+      sel = document.createElement("select");
+      sel.className = "mode-sel";
+      sel.title = "API first: out-of-buffer seeks here go through the player's own API. Plain only: never use it on this site.";
+      for (const [val, label] of [["auto", needs ? "API first" : "Plain first"], ["raw", "Plain only"]]) {
+        const o = document.createElement("option");
+        o.value = val;
+        o.textContent = label;
+        if ((p.mode === "raw" ? "raw" : "auto") === val) o.selected = true;
+        sel.appendChild(o);
+      }
+      sel.addEventListener("change", () => {
+        chrome.storage.local.get("siteProfiles", (r) => {
+          const all = (r && r.siteProfiles) || {};
+          all[host] = { ...(all[host] || {}), mode: sel.value, ts: Date.now() };
+          chrome.storage.local.set({ siteProfiles: all });
+        });
       });
-    });
+    }
     const del = document.createElement("button");
     del.type = "button";
     del.className = "del";
@@ -301,7 +306,8 @@ function renderLearned(profiles) {
         chrome.storage.local.set({ siteProfiles: all }, () => renderLearned(all));
       });
     });
-    row.append(name, tag, sel, del);
+    if (sel) row.append(name, tag, sel, del);
+    else row.append(name, tag, del);
     list.appendChild(row);
   }
 }
