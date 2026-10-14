@@ -272,12 +272,14 @@ function renderLearned(profiles) {
     tag.title = "API needed = a plain seek hung here, so out-of-buffer seeks go through the player's own API.";
     const sel = document.createElement("select");
     sel.className = "mode-sel";
-    sel.title = "How to seek on this site";
-    for (const [val, label] of [["auto", "Auto"], ["api", "API first"], ["raw", "Plain only"]]) {
+    sel.title = needs
+      ? "API first: out-of-buffer seeks here go through the player's own API. Plain only: never use the player's API on this site."
+      : "Plain first: a normal seek is tried first; the player's API is only used if the player hangs. Plain only: never use the player's API on this site.";
+    for (const [val, label] of [["auto", needs ? "API first" : "Plain first"], ["raw", "Plain only"]]) {
       const o = document.createElement("option");
       o.value = val;
       o.textContent = label;
-      if ((p.mode || "auto") === val) o.selected = true;
+      if ((p.mode === "raw" ? "raw" : "auto") === val) o.selected = true;
       sel.appendChild(o);
     }
     sel.addEventListener("change", () => {

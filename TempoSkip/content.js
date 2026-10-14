@@ -1,4 +1,4 @@
-// TempoSkip Content Script (v1.4.2)
+// TempoSkip Content Script (v1.4.4)
 // Runs at document_start across all frames to override playback speeds and Left/Right arrow skip durations.
 // Precision MSE seek engine: zero buffer snapping, serialized in-flight seeks, and pause-seek-play stall recovery.
 
@@ -626,10 +626,10 @@
     // ---- Strategy for unbuffered targets (either direction) ----
     // "auto": plain seek first. Only if the player really hangs (stalled AND its buffer stopped growing)
     //         do we seek through the player's own API, and we remember per site + direction that it needs that.
-    // "api" : API first.   "raw": never touch the player's API.   (per-site override in the popup)
+    // "raw": never touch the player's API (per-site override in the popup). Learned sites are API-first.
     const dirKey = goingBack ? "back" : "fwd";
     const profNow = () => siteProfiles[HOST_KEY] || null;
-    const siteMode = () => (profNow() && profNow().mode) || "auto";
+    const siteMode = () => (profNow() && profNow().mode === "raw" ? "raw" : "auto"); // legacy "api" == auto
     let lastBuf = bufStr(media);
     let apiTried = false;
     let recovering = false;
@@ -639,7 +639,7 @@
       const prof = profNow();
       const mode = siteMode();
       const knownNone = prof && prof.bridge === "none" && Date.now() - (prof.ts || 0) < NEG_TTL_MS;
-      if (mode === "raw" || (knownNone && mode !== "api")) {
+      if (mode === "raw" || knownNone) {
         dbg("player API skipped:", mode === "raw" ? "site set to plain seeks" : "cached: no API on this site");
         onFailed("skipped");
         return;
@@ -698,7 +698,7 @@
 
     // needsApi is one flag per site (older saved profiles stored {back, fwd}: either one counts).
     const needsApiLearned = (p) => !!p && (p.needsApi === true || (!!p.needsApi && typeof p.needsApi === "object" && Object.values(p.needsApi).some(Boolean)));
-    const prefersApi = siteMode() === "api" || needsApiLearned(profNow());
+    const prefersApi = siteMode() !== "raw" && needsApiLearned(profNow());
     if (prefersApi) {
       apiTried = true;
       dbg("learned/forced: this site needs the player API for unbuffered seeks");
