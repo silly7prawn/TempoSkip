@@ -14,7 +14,8 @@ const DEFAULT_SETTINGS = {
   enableSpeedHotkeys: true,   // '[' slower, ']' faster, '\\' reset speed
   speedStep: 0.25,            // Step size for '[' and ']' hotkeys
   showHud: true,              // Show sleek on-video HUD toast when speed/skip triggers
-  disabledHosts: []           // Array of hostnames where overrides are paused
+  disabledHosts: [],          // Array of hostnames where overrides are paused
+  autoSkipSites: {}           // { [hostname]: { intro, credits } } auto-click the player's Skip button (opt-in)
 };
 
 chrome.runtime.onInstalled.addListener(async () => {

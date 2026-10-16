@@ -1,4 +1,4 @@
-// TempoSkip Content Script (v1.4.5)
+// TempoSkip Content Script (v1.5.0)
 // Runs at document_start across all frames to override playback speeds and Left/Right arrow skip durations.
 // Precision MSE seek engine: zero buffer snapping, serialized in-flight seeks, and pause-seek-play stall recovery.
 
@@ -26,7 +26,8 @@
     enableSpeedHotkeys: true,
     speedStep: 0.25,
     showHud: true,
-    disabledHosts: []
+    disabledHosts: [],
+    autoSkipSites: {} // { [hostname]: { intro: bool, credits: bool } } - opt-in only
   };
 
   // Opt-in diagnostics: run  localStorage.temposkipDebug = "1"  in the player frame's console, then reload.
@@ -1029,6 +1030,80 @@
       return true;
     }
   });
+
+
+  // --- Auto-skip intro / credits (opt-in per site) ---
+  // Clicks the player's OWN "Skip intro/credits" button when it appears over the video. Never on by default.
+  // Deliberately narrow: the label must say skip + (intro|opening|recap) or (credits|ending|outro); ads, trials,
+  // "skip ahead" and "next episode" never match, and the button must sit on top of the playing video.
+  const AUTOSKIP_MIN_VISIBLE_MS = 500;
+  const AUTOSKIP_COOLDOWN_MS = 2500;
+  const skipFirstSeen = new WeakMap();
+  const skipClicked = new WeakSet();
+  let lastAutoSkipAt = 0;
+
+  function classifySkipLabel(label) {
+    const l = String(label || "").toLowerCase();
+    if (!/\bskip\b/.test(l)) return null;
+    if (/\bads?\b|advert|sponsor|trial|subscribe|survey|ahead/.test(l)) return null;
+    if (/intro|opening|recap|previously|title sequence/.test(l)) return "intro";
+    if (/credits?|ending|outro/.test(l)) return "credits";
+    return null;
+  }
+
+  function skipLabelOf(el) {
+    const text = (el.textContent || "").trim().slice(0, 60);
+    return [el.getAttribute("aria-label"), el.getAttribute("title"), text].filter(Boolean).join(" ");
+  }
+
+  function isActuallyVisible(el) {
+    try {
+      if (typeof el.checkVisibility === "function") {
+        return el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true });
+      }
+    } catch (_) {}
+    return el.getClientRects().length > 0;
+  }
+
+  function autoSkipConfig() {
+    const cfg = settings.autoSkipSites && settings.autoSkipSites[HOST_KEY];
+    return cfg && (cfg.intro || cfg.credits) ? cfg : null;
+  }
+
+  function scanAutoSkip() {
+    const cfg = autoSkipConfig();
+    if (!cfg || !isSiteEnabled()) return;
+    const now = performance.now();
+    const media = getBestMediaElement();
+    if (!media || media.paused || media.ended) return;
+    const vr = media.getBoundingClientRect();
+    if (vr.width < 120 || vr.height < 80) return;
+
+    const nodes = document.querySelectorAll('button, [role="button"]');
+    for (const el of nodes) {
+      if (skipClicked.has(el) || el.disabled) continue;
+      const kind = classifySkipLabel(skipLabelOf(el));
+      if (!kind || !cfg[kind]) continue;
+      if (!isActuallyVisible(el)) continue;
+      const r = el.getBoundingClientRect();
+      const cx = r.left + r.width / 2;
+      const cy = r.top + r.height / 2;
+      if (cx < vr.left || cx > vr.right || cy < vr.top || cy > vr.bottom) continue; // must be over the video
+      if (!skipFirstSeen.has(el)) {
+        skipFirstSeen.set(el, now); // must stay on screen briefly: ignore transient flashes
+        continue;
+      }
+      if (now - skipFirstSeen.get(el) < AUTOSKIP_MIN_VISIBLE_MS) continue;
+      if (now - lastAutoSkipAt < AUTOSKIP_COOLDOWN_MS) continue; // one auto-click per cooldown window
+      skipClicked.add(el);
+      lastAutoSkipAt = now;
+      dbg("auto-skip click:", kind, JSON.stringify(skipLabelOf(el)));
+      try { el.click(); } catch (_) {}
+      showHudToast(kind === "intro" ? "\u23ED Skipped intro" : "\u23ED Skipped credits", media);
+      return;
+    }
+  }
+  setInterval(scanAutoSkip, 300);
 
   // --- Observe DOM Mutations for Dynamically Injected Players ---
   const observer = new MutationObserver((mutations) => {

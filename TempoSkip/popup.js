@@ -14,7 +14,8 @@ const DEFAULT_SETTINGS = {
   enableSpeedHotkeys: true,
   speedStep: 0.25,
   showHud: true,
-  disabledHosts: []
+  disabledHosts: [],
+  autoSkipSites: {}
 };
 
 const els = {
@@ -39,7 +40,10 @@ const els = {
   safeMseSeekToggle: document.getElementById("safeMseSeekToggle"),
   speedHotkeysToggle: document.getElementById("speedHotkeysToggle"),
   showHudToggle: document.getElementById("showHudToggle"),
-  resetDefaultsBtn: document.getElementById("resetDefaultsBtn")
+  resetDefaultsBtn: document.getElementById("resetDefaultsBtn"),
+  autoSkipHost: document.getElementById("autoSkipHost"),
+  autoSkipIntroToggle: document.getElementById("autoSkipIntroToggle"),
+  autoSkipCreditsToggle: document.getElementById("autoSkipCreditsToggle")
 };
 
 let currentSettings = { ...DEFAULT_SETTINGS };
@@ -109,6 +113,7 @@ function renderUI() {
 
   highlightActivePresets();
   renderSiteStatus();
+  renderAutoSkip();
 }
 
 async function savePatch(patch) {
@@ -131,6 +136,7 @@ async function queryActiveTabStatus() {
       } catch (_) {}
     }
     renderSiteStatus();
+    renderAutoSkip();
 
     chrome.tabs.sendMessage(tab.id, { type: "GET_STATUS" }, (resp) => {
       if (chrome.runtime.lastError || !resp) {
@@ -244,6 +250,27 @@ els.resetDefaultsBtn.addEventListener("click", async () => {
   await chrome.storage.sync.set(DEFAULT_SETTINGS);
   renderUI();
 });
+
+
+// --- Auto-skip (per site, opt-in) ---
+function renderAutoSkip() {
+  const cfg = (currentSettings.autoSkipSites || {})[activeHostname] || {};
+  els.autoSkipHost.textContent = activeHostname || "open a video site to enable";
+  els.autoSkipIntroToggle.checked = Boolean(cfg.intro);
+  els.autoSkipCreditsToggle.checked = Boolean(cfg.credits);
+  els.autoSkipIntroToggle.disabled = els.autoSkipCreditsToggle.disabled = !activeHostname;
+}
+
+function saveAutoSkip() {
+  if (!activeHostname) return;
+  const sites = { ...(currentSettings.autoSkipSites || {}) };
+  const next = { intro: els.autoSkipIntroToggle.checked, credits: els.autoSkipCreditsToggle.checked };
+  if (next.intro || next.credits) sites[activeHostname] = next;
+  else delete sites[activeHostname];
+  savePatch({ autoSkipSites: sites });
+}
+els.autoSkipIntroToggle.addEventListener("change", saveAutoSkip);
+els.autoSkipCreditsToggle.addEventListener("change", saveAutoSkip);
 
 // --- Learned per-site seek profiles ---
 function renderLearned(profiles) {
