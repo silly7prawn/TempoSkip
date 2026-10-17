@@ -1,4 +1,4 @@
-// TempoSkip Content Script (v1.5.0)
+// TempoSkip Content Script (v1.6.0)
 // Runs at document_start across all frames to override playback speeds and Left/Right arrow skip durations.
 // Precision MSE seek engine: zero buffer snapping, serialized in-flight seeks, and pause-seek-play stall recovery.
 
@@ -27,7 +27,7 @@
     speedStep: 0.25,
     showHud: true,
     disabledHosts: [],
-    autoSkipSites: {} // { [hostname]: { intro: bool, credits: bool } } - opt-in only
+    autoSkipSites: {} // legacy (v1.5): { [hostname]: { intro, credits } } - only used to migrate old ticks
   };
 
   // Opt-in diagnostics: run  localStorage.temposkipDebug = "1"  in the player frame's console, then reload.
@@ -975,8 +975,9 @@
   });
 
   chrome.storage.onChanged.addListener((changes, area) => {
-    if (area === "local" && changes.siteProfiles) {
-      siteProfiles = changes.siteProfiles.newValue || {};
+    if (area === "local") {
+      if (changes.siteProfiles) siteProfiles = changes.siteProfiles.newValue || {};
+      if (changes.skipRules) skipRules = changes.skipRules.newValue || {};
       return;
     }
     if (area !== "sync") return;
@@ -1032,28 +1033,53 @@
   });
 
 
-  // --- Auto-skip intro / credits (opt-in per site) ---
-  // Clicks the player's OWN "Skip intro/credits" button when it appears over the video. Never on by default.
-  // Deliberately narrow: the label must say skip + (intro|opening|recap) or (credits|ending|outro); ads, trials,
-  // "skip ahead" and "next episode" never match, and the button must sit on top of the playing video.
-  const AUTOSKIP_MIN_VISIBLE_MS = 500;
-  const AUTOSKIP_COOLDOWN_MS = 2500;
+  // --- Skip-button learning + auto-click ---
+  // Every button labelled "Skip ..." that sits over a video is recorded per site (storage.local `skipRules`),
+  // switched OFF by default. The popup lists them with one toggle each; only enabled ones are ever clicked.
+  const AUTOSKIP_MIN_VISIBLE_MS = 500;   // must stay on screen this long (ignores transient flashes)
+  const AUTOSKIP_COOLDOWN_MS = 2500;     // at most one auto-click per window
+  const AUTOSKIP_MAX_ATTEMPTS = 2;       // retry once if the button is still there afterwards
+  let skipRules = {};                    // { [host]: { [key]: { label, enabled, seen, lastSeen } } }
   const skipFirstSeen = new WeakMap();
-  const skipClicked = new WeakSet();
+  const skipAttempts = new WeakMap();    // element -> { n, last }
+  const skipLearnedEls = new WeakSet();
+  let pendingLearn = new Map();
+  let learnTimer = null;
   let lastAutoSkipAt = 0;
 
-  function classifySkipLabel(label) {
-    const l = String(label || "").toLowerCase();
-    if (!/\bskip\b/.test(l)) return null;
-    if (/\bads?\b|advert|sponsor|trial|subscribe|survey|ahead/.test(l)) return null;
-    if (/intro|opening|recap|previously|title sequence/.test(l)) return "intro";
-    if (/credits?|ending|outro/.test(l)) return "credits";
-    return null;
+  function loadSkipRules() {
+    try {
+      chrome.storage.local.get("skipRules", (r) => {
+        if (chrome.runtime.lastError) return;
+        skipRules = (r && r.skipRules) || {};
+      });
+    } catch (_) {}
   }
+  loadSkipRules();
 
-  function skipLabelOf(el) {
-    const text = (el.textContent || "").trim().slice(0, 60);
-    return [el.getAttribute("aria-label"), el.getAttribute("title"), text].filter(Boolean).join(" ");
+  function skipPrimaryLabel(el) {
+    const aria = (el.getAttribute("aria-label") || "").trim();
+    if (aria) return aria;
+    const txt = (el.textContent || "").replace(/\s+/g, " ").trim();
+    if (txt) return txt.slice(0, 60);
+    return (el.getAttribute("title") || "").trim();
+  }
+  // Strictly "Skip ...". (Accessibility links like "Skip to main content" are not player buttons.)
+  function isSkipLabel(label) {
+    return /^skip\b/i.test(label) && !/^skip\s+(to|navigation|nav)\b/i.test(label);
+  }
+  // Countdown digits vary ("Skip in 5"), so they are folded out of the identity key.
+  function skipKey(label) {
+    return label.toLowerCase().replace(/\s+/g, " ").replace(/\d+/g, "#").trim();
+  }
+  // Carry over the older Intro / Credits ticks (settings.autoSkipSites) to the matching learned buttons.
+  function legacyEnabledFor(label) {
+    const cfg = settings.autoSkipSites && settings.autoSkipSites[HOST_KEY];
+    if (!cfg) return false;
+    const l = label.toLowerCase();
+    if (/intro|opening|recap|previously|title sequence/.test(l)) return !!cfg.intro;
+    if (/credits?|ending|outro/.test(l)) return !!cfg.credits;
+    return false;
   }
 
   function isActuallyVisible(el) {
@@ -1065,45 +1091,101 @@
     return el.getClientRects().length > 0;
   }
 
-  function autoSkipConfig() {
-    const cfg = settings.autoSkipSites && settings.autoSkipSites[HOST_KEY];
-    return cfg && (cfg.intro || cfg.credits) ? cfg : null;
+  function flushLearned() {
+    learnTimer = null;
+    const batch = pendingLearn;
+    pendingLearn = new Map();
+    if (!batch.size || !HOST_KEY) return;
+    try {
+      // Read-modify-write so frames/tabs don't clobber each other and the user's toggles are preserved.
+      chrome.storage.local.get("skipRules", (r) => {
+        if (chrome.runtime.lastError) return;
+        const all = (r && r.skipRules) || {};
+        const host = (all[HOST_KEY] = all[HOST_KEY] || {});
+        for (const [key, label] of batch) {
+          const cur = host[key];
+          if (cur) {
+            cur.seen = (cur.seen || 0) + 1;
+            cur.lastSeen = Date.now();
+          } else {
+            host[key] = { label, enabled: legacyEnabledFor(label), seen: 1, lastSeen: Date.now() };
+          }
+        }
+        skipRules = all;
+        chrome.storage.local.set({ skipRules: all });
+      });
+    } catch (_) {}
   }
 
-  function scanAutoSkip() {
-    const cfg = autoSkipConfig();
-    if (!cfg || !isSiteEnabled()) return;
-    const now = performance.now();
-    const media = getBestMediaElement();
-    if (!media || media.paused || media.ended) return;
-    const vr = media.getBoundingClientRect();
-    if (vr.width < 120 || vr.height < 80) return;
+  function learnSkipButton(key, label) {
+    // Create the rule in memory straight away so a carried-over (legacy) enable works on first sight.
+    const host = (skipRules[HOST_KEY] = skipRules[HOST_KEY] || {});
+    if (!host[key]) host[key] = { label, enabled: legacyEnabledFor(label), seen: 0, lastSeen: Date.now() };
+    pendingLearn.set(key, label);
+    if (!learnTimer) learnTimer = setTimeout(flushLearned, 800);
+  }
 
-    const nodes = document.querySelectorAll('button, [role="button"]');
-    for (const el of nodes) {
-      if (skipClicked.has(el) || el.disabled) continue;
-      const kind = classifySkipLabel(skipLabelOf(el));
-      if (!kind || !cfg[kind]) continue;
+  function pickScanMedia() {
+    let best = null;
+    let bestScore = 0;
+    for (const m of trackedMedia) {
+      if (!m.isConnected || m.tagName !== "VIDEO") continue;
+      const r = m.getBoundingClientRect();
+      if (r.width < 120 || r.height < 80) continue;
+      const score = r.width * r.height * (m.paused ? 1 : 1000);
+      if (score > bestScore) {
+        bestScore = score;
+        best = m;
+      }
+    }
+    return best;
+  }
+
+  function scanSkipButtons() {
+    if (!isSiteEnabled() || trackedMedia.size === 0) return;
+    const media = pickScanMedia();
+    if (!media) return;
+    const vr = media.getBoundingClientRect();
+    const now = performance.now();
+
+    for (const el of document.querySelectorAll('button, [role="button"]')) {
+      const label = skipPrimaryLabel(el);
+      if (!label || !isSkipLabel(label)) continue;
       if (!isActuallyVisible(el)) continue;
       const r = el.getBoundingClientRect();
       const cx = r.left + r.width / 2;
       const cy = r.top + r.height / 2;
       if (cx < vr.left || cx > vr.right || cy < vr.top || cy > vr.bottom) continue; // must be over the video
+
+      const key = skipKey(label);
+      if (!skipLearnedEls.has(el)) {
+        skipLearnedEls.add(el);
+        learnSkipButton(key, label);
+      }
+
+      const rule = skipRules[HOST_KEY] && skipRules[HOST_KEY][key];
+      if (!rule || !rule.enabled) continue;
+      if (media.paused || media.ended) continue;
+      if (el.disabled || el.getAttribute("aria-disabled") === "true") continue; // e.g. "Skip in 5" countdown
+
       if (!skipFirstSeen.has(el)) {
-        skipFirstSeen.set(el, now); // must stay on screen briefly: ignore transient flashes
+        skipFirstSeen.set(el, now);
         continue;
       }
       if (now - skipFirstSeen.get(el) < AUTOSKIP_MIN_VISIBLE_MS) continue;
-      if (now - lastAutoSkipAt < AUTOSKIP_COOLDOWN_MS) continue; // one auto-click per cooldown window
-      skipClicked.add(el);
+      if (now - lastAutoSkipAt < AUTOSKIP_COOLDOWN_MS) continue;
+      const at = skipAttempts.get(el) || { n: 0, last: 0 };
+      if (at.n >= AUTOSKIP_MAX_ATTEMPTS || (at.n > 0 && now - at.last < 2500)) continue;
+
+      skipAttempts.set(el, { n: at.n + 1, last: now });
       lastAutoSkipAt = now;
-      dbg("auto-skip click:", kind, JSON.stringify(skipLabelOf(el)));
+      dbg("auto-skip click:", JSON.stringify(label));
       try { el.click(); } catch (_) {}
-      showHudToast(kind === "intro" ? "\u23ED Skipped intro" : "\u23ED Skipped credits", media);
+      showHudToast("\u23ED " + label.slice(0, 32), media);
       return;
     }
   }
-  setInterval(scanAutoSkip, 300);
+  setInterval(scanSkipButtons, 300);
 
   // --- Observe DOM Mutations for Dynamically Injected Players ---
   const observer = new MutationObserver((mutations) => {

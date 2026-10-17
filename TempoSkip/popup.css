@@ -421,3 +421,9 @@ kbd {
 .learned-row .mode-sel { background: #0f172a; color: #cbd5e1; border: 1px solid #334155; border-radius: 6px; font-size: 10.5px; padding: 1px 2px; }
 .auto-host { font-size: 11px; color: #94a3b8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 60%; }
 #autoSkipCard .learned-empty { margin-top: 6px; }
+.skip-rules { display: flex; flex-direction: column; gap: 2px; }
+.skip-rule-row { align-items: center; }
+.skip-rule-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.skip-rule-seen { font-size: 10px; color: #64748b; }
+.skip-rule-row .del { background: none; border: none; color: #64748b; cursor: pointer; font-size: 13px; line-height: 1; padding: 0 2px; }
+.skip-rule-row .del:hover { color: #f87171; }

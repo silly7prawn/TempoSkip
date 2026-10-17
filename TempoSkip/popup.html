@@ -159,21 +159,14 @@
       </label>
     </section>
 
-    <!-- Auto-skip intro / credits (per site, opt-in) -->
+    <!-- Skip buttons learned on this site (one toggle each) -->
     <section class="card compact-card" id="autoSkipCard">
       <div class="learned-head">
-        <span class="card-title">Auto-skip</span>
+        <span class="card-title">Skip buttons</span>
         <span class="auto-host" id="autoSkipHost"></span>
       </div>
-      <label class="check-row" title="Clicks the player's own Skip button for intros, openings and recaps">
-        <input type="checkbox" id="autoSkipIntroToggle" />
-        <span>Intro / opening / recap</span>
-      </label>
-      <label class="check-row" title="Clicks the player's own Skip button for credits and endings">
-        <input type="checkbox" id="autoSkipCreditsToggle" />
-        <span>Credits / ending</span>
-      </label>
-      <div class="learned-empty">Off by default, per site. Only clicks the player's own Skip button while the video is playing. Never ads.</div>
+      <div id="skipRulesList" class="skip-rules"></div>
+      <div class="learned-empty">Any button labelled &ldquo;Skip &hellip;&rdquo; over a video is added here automatically. All start off; tick the ones to click for you while the video plays.</div>
     </section>
 
     <!-- Learned per-site seek profiles -->

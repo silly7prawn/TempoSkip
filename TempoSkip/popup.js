@@ -42,8 +42,7 @@ const els = {
   showHudToggle: document.getElementById("showHudToggle"),
   resetDefaultsBtn: document.getElementById("resetDefaultsBtn"),
   autoSkipHost: document.getElementById("autoSkipHost"),
-  autoSkipIntroToggle: document.getElementById("autoSkipIntroToggle"),
-  autoSkipCreditsToggle: document.getElementById("autoSkipCreditsToggle")
+  skipRulesList: document.getElementById("skipRulesList")
 };
 
 let currentSettings = { ...DEFAULT_SETTINGS };
@@ -252,25 +251,76 @@ els.resetDefaultsBtn.addEventListener("click", async () => {
 });
 
 
-// --- Auto-skip (per site, opt-in) ---
+// --- Skip buttons learned on the active site (one toggle each) ---
+let skipRulesCache = {};
+
 function renderAutoSkip() {
-  const cfg = (currentSettings.autoSkipSites || {})[activeHostname] || {};
-  els.autoSkipHost.textContent = activeHostname || "open a video site to enable";
-  els.autoSkipIntroToggle.checked = Boolean(cfg.intro);
-  els.autoSkipCreditsToggle.checked = Boolean(cfg.credits);
-  els.autoSkipIntroToggle.disabled = els.autoSkipCreditsToggle.disabled = !activeHostname;
+  els.autoSkipHost.textContent = activeHostname || "open a video site";
+  const list = els.skipRulesList;
+  list.textContent = "";
+  const rules = (skipRulesCache && skipRulesCache[activeHostname]) || {};
+  const keys = Object.keys(rules).sort((a, b) => (rules[b].lastSeen || 0) - (rules[a].lastSeen || 0));
+  if (!activeHostname || !keys.length) {
+    const e = document.createElement("div");
+    e.className = "learned-empty";
+    e.textContent = activeHostname ? "No Skip buttons seen on this site yet." : "Open a video site to see its Skip buttons.";
+    list.appendChild(e);
+    return;
+  }
+  for (const key of keys) {
+    const rule = rules[key];
+    const row = document.createElement("label");
+    row.className = "check-row skip-rule-row";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = Boolean(rule.enabled);
+    cb.addEventListener("change", () => updateSkipRule(key, { enabled: cb.checked }));
+    const name = document.createElement("span");
+    name.className = "skip-rule-label";
+    name.textContent = rule.label || key;
+    const seen = document.createElement("span");
+    seen.className = "skip-rule-seen";
+    seen.textContent = "seen " + (rule.seen || 0) + "\u00D7";
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "del";
+    del.title = "Forget this button";
+    del.textContent = "\u2715";
+    del.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      updateSkipRule(key, null);
+    });
+    row.append(cb, name, seen, del);
+    list.appendChild(row);
+  }
 }
 
-function saveAutoSkip() {
+function updateSkipRule(key, patch) {
   if (!activeHostname) return;
-  const sites = { ...(currentSettings.autoSkipSites || {}) };
-  const next = { intro: els.autoSkipIntroToggle.checked, credits: els.autoSkipCreditsToggle.checked };
-  if (next.intro || next.credits) sites[activeHostname] = next;
-  else delete sites[activeHostname];
-  savePatch({ autoSkipSites: sites });
+  chrome.storage.local.get("skipRules", (r) => {
+    const all = (r && r.skipRules) || {};
+    const host = (all[activeHostname] = all[activeHostname] || {});
+    if (patch === null) delete host[key];
+    else if (host[key]) host[key] = { ...host[key], ...patch };
+    if (!Object.keys(host).length) delete all[activeHostname];
+    skipRulesCache = all;
+    chrome.storage.local.set({ skipRules: all }, renderAutoSkip);
+  });
 }
-els.autoSkipIntroToggle.addEventListener("change", saveAutoSkip);
-els.autoSkipCreditsToggle.addEventListener("change", saveAutoSkip);
+
+function loadSkipRules() {
+  chrome.storage.local.get("skipRules", (r) => {
+    skipRulesCache = (r && r.skipRules) || {};
+    renderAutoSkip();
+  });
+}
+// Live-update while the popup is open (new buttons are learned as the video plays).
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "local" && changes.skipRules) {
+    skipRulesCache = changes.skipRules.newValue || {};
+    renderAutoSkip();
+  }
+});
 
 // --- Learned per-site seek profiles ---
 function renderLearned(profiles) {
@@ -382,4 +432,5 @@ chrome.storage.sync.get(null, (stored) => {
   renderUI();
   queryActiveTabStatus();
   loadLearned();
+  loadSkipRules();
 });
