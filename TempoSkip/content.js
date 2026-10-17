@@ -1034,7 +1034,7 @@
 
 
   // --- Skip-button learning + auto-click ---
-  // Every button labelled "Skip ..." that sits over a video is recorded per site (storage.local `skipRules`),
+  // Every "Skip ..." button the user clicks is recorded per site (storage.local `skipRules`),
   // switched OFF by default. The popup lists them with one toggle each; only enabled ones are ever clicked.
   const AUTOSKIP_MIN_VISIBLE_MS = 500;   // must stay on screen this long (ignores transient flashes)
   const AUTOSKIP_COOLDOWN_MS = 2500;     // at most one auto-click per window
@@ -1042,7 +1042,6 @@
   let skipRules = {};                    // { [host]: { [key]: { label, enabled, seen, lastSeen } } }
   const skipFirstSeen = new WeakMap();
   const skipAttempts = new WeakMap();    // element -> { n, last }
-  const skipLearnedEls = new WeakSet();
   let pendingLearn = new Map();
   let learnTimer = null;
   let lastAutoSkipAt = 0;
@@ -1082,13 +1081,23 @@
     return false;
   }
 
-  function isActuallyVisible(el) {
+  // "Rendered" = could be seen if its opacity were up (not display:none / visibility:hidden).
+  function isRendered(el) {
     try {
-      if (typeof el.checkVisibility === "function") {
-        return el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true });
-      }
+      if (typeof el.checkVisibility === "function") return el.checkVisibility({ checkVisibilityCSS: true });
     } catch (_) {}
     return el.getClientRects().length > 0;
+  }
+  function effectiveOpacity(el) {
+    let o = 1;
+    for (let n = el; n && n.nodeType === 1; n = n.parentElement) o *= parseFloat(getComputedStyle(n).opacity || "1");
+    return o;
+  }
+  // Players like Crunchyroll keep the button in the DOM permanently (opacity 0, aria-hidden="true")
+  // and reveal it when a segment is skippable. Learning needs only presence; clicking needs availability.
+  function isSkipAvailable(el) {
+    if (!isRendered(el)) return false;
+    return effectiveOpacity(el) > 0.5;
   }
 
   function flushLearned() {
@@ -1125,58 +1134,60 @@
     if (!learnTimer) learnTimer = setTimeout(flushLearned, 800);
   }
 
-  function pickScanMedia() {
-    let best = null;
-    let bestScore = 0;
-    for (const m of trackedMedia) {
-      if (!m.isConnected || m.tagName !== "VIDEO") continue;
-      const r = m.getBoundingClientRect();
-      if (r.width < 120 || r.height < 80) continue;
-      const score = r.width * r.height * (m.paused ? 1 : 1000);
-      if (score > bestScore) {
-        bestScore = score;
-        best = m;
-      }
-    }
-    return best;
+  function playingMedia() {
+    for (const m of trackedMedia) if (m.isConnected && !m.paused && !m.ended) return m;
+    return null;
   }
 
-  function scanSkipButtons() {
-    if (!isSiteEnabled() || trackedMedia.size === 0) return;
-    const media = pickScanMedia();
-    if (!media) return;
-    const vr = media.getBoundingClientRect();
-    const now = performance.now();
+  // LEARNING: only from the user's own interaction. A real (trusted) click on any "Skip ..." button
+  // adds it to this site's list and flashes a hint. No page scanning.
+  function onUserInteract(e) {
+    if (!e.isTrusted || !HOST_KEY) return;
+    const t = e.target;
+    if (!t || !t.closest) return;
+    const el = t.closest('button, [role="button"], a');
+    if (!el) return;
+    const label = skipPrimaryLabel(el);
+    if (!label || !isSkipLabel(label)) return;
+    const key = skipKey(label);
+    const host = skipRules[HOST_KEY] || {};
+    const isNew = !host[key];
+    learnSkipButton(key, label);
+    if (isNew && !skipRules[HOST_KEY][key].enabled) {
+      showHudToast("\u23ED \u201C" + label.slice(0, 24) + "\u201D saved \u2014 toggle Auto-click for it in TempoSkip settings", el.closest("video") || playingMedia() || [...trackedMedia][0]);
+    }
+  }
+  window.addEventListener("click", onUserInteract, true);
+  window.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") onUserInteract(e); }, true);
 
-    for (const el of document.querySelectorAll('button, [role="button"]')) {
+  // AUTO-CLICK: runs only while this site has an enabled rule and media is playing, and only looks
+  // for buttons with a matching aria-label (one native attribute query, not a page walk).
+  function hasEnabledRule() {
+    const host = skipRules[HOST_KEY];
+    if (!host) return false;
+    for (const k in host) if (host[k].enabled) return true;
+    return false;
+  }
+  function autoClickTick() {
+    if (!HOST_KEY || !hasEnabledRule() || !isSiteEnabled()) return;
+    const media = playingMedia();
+    if (!media) return;
+    const rules = skipRules[HOST_KEY];
+    const now = performance.now();
+    let cands;
+    try { cands = document.querySelectorAll('[aria-label^="skip" i]'); } catch (_) { return; }
+    for (const el of cands) {
       const label = skipPrimaryLabel(el);
       if (!label || !isSkipLabel(label)) continue;
-      if (!isActuallyVisible(el)) continue;
-      const r = el.getBoundingClientRect();
-      const cx = r.left + r.width / 2;
-      const cy = r.top + r.height / 2;
-      if (cx < vr.left || cx > vr.right || cy < vr.top || cy > vr.bottom) continue; // must be over the video
-
-      const key = skipKey(label);
-      if (!skipLearnedEls.has(el)) {
-        skipLearnedEls.add(el);
-        learnSkipButton(key, label);
-      }
-
-      const rule = skipRules[HOST_KEY] && skipRules[HOST_KEY][key];
+      const rule = rules[skipKey(label)];
       if (!rule || !rule.enabled) continue;
-      if (media.paused || media.ended) continue;
+      if (!isSkipAvailable(el)) { skipFirstSeen.delete(el); continue; }
       if (el.disabled || el.getAttribute("aria-disabled") === "true") continue; // e.g. "Skip in 5" countdown
-
-      if (!skipFirstSeen.has(el)) {
-        skipFirstSeen.set(el, now);
-        continue;
-      }
+      if (!skipFirstSeen.has(el)) { skipFirstSeen.set(el, now); continue; }
       if (now - skipFirstSeen.get(el) < AUTOSKIP_MIN_VISIBLE_MS) continue;
       if (now - lastAutoSkipAt < AUTOSKIP_COOLDOWN_MS) continue;
       const at = skipAttempts.get(el) || { n: 0, last: 0 };
       if (at.n >= AUTOSKIP_MAX_ATTEMPTS || (at.n > 0 && now - at.last < 2500)) continue;
-
       skipAttempts.set(el, { n: at.n + 1, last: now });
       lastAutoSkipAt = now;
       dbg("auto-skip click:", JSON.stringify(label));
@@ -1185,7 +1196,7 @@
       return;
     }
   }
-  setInterval(scanSkipButtons, 300);
+  setInterval(autoClickTick, 300);
 
   // --- Observe DOM Mutations for Dynamically Injected Players ---
   const observer = new MutationObserver((mutations) => {

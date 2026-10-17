@@ -263,7 +263,7 @@ function renderAutoSkip() {
   if (!activeHostname || !keys.length) {
     const e = document.createElement("div");
     e.className = "learned-empty";
-    e.textContent = activeHostname ? "No Skip buttons seen on this site yet." : "Open a video site to see its Skip buttons.";
+    e.textContent = activeHostname ? "None yet \u2014 click a Skip button on the video once to add it." : "Open a video site to see its Skip buttons.";
     list.appendChild(e);
     return;
   }
