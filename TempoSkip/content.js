@@ -1181,12 +1181,13 @@
       if (!label || !isSkipLabel(label)) continue;
       const rule = rules[skipKey(label)];
       if (!rule || !rule.enabled) continue;
-      if (!isSkipAvailable(el)) { skipFirstSeen.delete(el); continue; }
+      if (!isSkipAvailable(el)) { skipFirstSeen.delete(el); skipAttempts.delete(el); continue; } // hidden again => next appearance is a fresh chance
       if (el.disabled || el.getAttribute("aria-disabled") === "true") continue; // e.g. "Skip in 5" countdown
       if (!skipFirstSeen.has(el)) { skipFirstSeen.set(el, now); continue; }
       if (now - skipFirstSeen.get(el) < AUTOSKIP_MIN_VISIBLE_MS) continue;
       if (now - lastAutoSkipAt < AUTOSKIP_COOLDOWN_MS) continue;
-      const at = skipAttempts.get(el) || { n: 0, last: 0 };
+      let at = skipAttempts.get(el) || { n: 0, last: 0 };
+      if (at.n && now - at.last > 8000) at = { n: 0, last: 0 }; // stale attempts expire (player reuses one element)
       if (at.n >= AUTOSKIP_MAX_ATTEMPTS || (at.n > 0 && now - at.last < 2500)) continue;
       skipAttempts.set(el, { n: at.n + 1, last: now });
       lastAutoSkipAt = now;
