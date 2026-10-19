@@ -427,6 +427,6 @@ kbd {
 .skip-rule-seen { font-size: 10px; color: #64748b; }
 .skip-rule-row .del { background: none; border: none; color: #64748b; cursor: pointer; font-size: 13px; line-height: 1; padding: 0 2px; }
 .skip-rule-row .del:hover { color: #f87171; }
-.step-row { justify-content: space-between; }
-.step-row input { width: 64px; margin-left: auto; }
-.step-row .unit { color: #64748b; font-size: 11px; }
+.step-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 11.5px; color: #cbd5e1; padding-left: 21px; }
+.step-hint { color: #64748b; }
+.step-field { width: 86px; flex-shrink: 0; }
