@@ -1129,12 +1129,16 @@
     } catch (_) {}
   }
 
-  function learnSkipButton(key, label) {
+  function learnSkipButton(key, label, immediate) {
     // Create the rule in memory straight away so a carried-over (legacy) enable works on first sight.
     const host = (skipRules[HOST_KEY] = skipRules[HOST_KEY] || {});
     if (!host[key]) host[key] = { label, enabled: legacyEnabledFor(label), seen: 0, lastSeen: Date.now() };
     pendingLearn.set(key, label);
-    if (!learnTimer) learnTimer = setTimeout(flushLearned, 800);
+    if (immediate) {
+      // A user press can navigate away (e.g. "Skip Credits" -> next episode): save before the page unloads.
+      if (learnTimer) { clearTimeout(learnTimer); learnTimer = null; }
+      flushLearned();
+    } else if (!learnTimer) learnTimer = setTimeout(flushLearned, 800);
   }
 
   function playingMedia() {
@@ -1145,11 +1149,25 @@
   // LEARNING: only from the user's own interaction. A real (trusted) click on any "Skip ..." button
   // adds it to this site's list and flashes a hint. No page scanning.
   const lastLearnAt = {};
+  // The element the press was aimed at: normally the event target's button, but also any Skip button whose
+  // box contains the pointer (covers players whose Skip button has pointer-events:none or sits under an overlay).
+  function skipButtonForPress(e) {
+    const t = e.target;
+    const hit = t && t.closest ? t.closest('button, [role="button"], a') : null;
+    if (hit && isSkipLabel(skipPrimaryLabel(hit))) return hit;
+    if (typeof e.clientX !== "number" || (e.clientX === 0 && e.clientY === 0)) return null;
+    let list;
+    try { list = document.querySelectorAll('[aria-label^="skip" i]'); } catch (_) { return null; }
+    for (const el of list) {
+      if (!isSkipLabel(skipPrimaryLabel(el)) || !isSkipAvailable(el)) continue;
+      const r = el.getBoundingClientRect();
+      if (e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom) return el;
+    }
+    return null;
+  }
   function onUserInteract(e) {
     if (!e.isTrusted || !HOST_KEY) return;
-    const t = e.target;
-    if (!t || !t.closest) return;
-    const el = t.closest('button, [role="button"], a');
+    const el = skipButtonForPress(e);
     if (!el) return;
     const label = skipPrimaryLabel(el);
     if (!label || !isSkipLabel(label)) return;
@@ -1159,11 +1177,12 @@
     lastLearnAt[key] = nowMs;
     const host = skipRules[HOST_KEY] || {};
     const isNew = !host[key];
-    learnSkipButton(key, label);
+    learnSkipButton(key, label, true);
     if (isNew && !skipRules[HOST_KEY][key].enabled) {
       showHudToast("\u23ED \u201C" + label.slice(0, 24) + "\u201D saved \u2014 toggle Auto-click for it in TempoSkip settings", el.closest("video") || playingMedia() || [...trackedMedia][0]);
     }
   }
+  window.addEventListener("pagehide", () => { if (learnTimer) { clearTimeout(learnTimer); flushLearned(); } });
   window.addEventListener("pointerdown", onUserInteract, true);
   window.addEventListener("click", onUserInteract, true);
   window.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") onUserInteract(e); }, true);
