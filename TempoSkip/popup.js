@@ -39,6 +39,7 @@ const els = {
   shiftSkipRow: document.getElementById("shiftSkipRow"),
   safeMseSeekToggle: document.getElementById("safeMseSeekToggle"),
   speedHotkeysToggle: document.getElementById("speedHotkeysToggle"),
+  speedStepInput: document.getElementById("speedStepInput"),
   showHudToggle: document.getElementById("showHudToggle"),
   resetDefaultsBtn: document.getElementById("resetDefaultsBtn"),
   autoSkipHost: document.getElementById("autoSkipHost"),
@@ -108,6 +109,8 @@ function renderUI() {
 
   els.safeMseSeekToggle.checked = Boolean(currentSettings.safeMseSeek);
   els.speedHotkeysToggle.checked = Boolean(currentSettings.enableSpeedHotkeys);
+  els.speedStepInput.value = currentSettings.speedStep;
+  els.speedStepInput.disabled = !currentSettings.enableSpeedHotkeys;
   els.showHudToggle.checked = Boolean(currentSettings.showHud);
 
   highlightActivePresets();
@@ -234,6 +237,12 @@ els.shiftForwardInput.addEventListener("change", () => {
 
 els.safeMseSeekToggle.addEventListener("change", () => {
   savePatch({ safeMseSeek: els.safeMseSeekToggle.checked });
+});
+
+els.speedStepInput.addEventListener("change", () => {
+  const v = Math.round(Math.min(4, Math.max(0.01, Number(els.speedStepInput.value) || 0.25)) * 100) / 100;
+  els.speedStepInput.value = v;
+  savePatch({ speedStep: v });
 });
 
 els.speedHotkeysToggle.addEventListener("change", () => {

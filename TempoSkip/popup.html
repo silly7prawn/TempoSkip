@@ -153,6 +153,11 @@
         <input type="checkbox" id="speedHotkeysToggle" checked />
         <span>Speed hotkeys: <kbd>[</kbd> slower, <kbd>]</kbd> faster, <kbd>\</kbd> 1.0×</span>
       </label>
+      <label class="check-row step-row">
+        <span>Hotkey step (speed change per <kbd>[</kbd> / <kbd>]</kbd>)</span>
+        <input type="number" id="speedStepInput" min="0.01" max="4" step="0.05" value="0.25" />
+        <span class="unit">&times;</span>
+      </label>
       <label class="check-row">
         <input type="checkbox" id="showHudToggle" checked />
         <span>Show on-video HUD indicator on speed/skip</span>

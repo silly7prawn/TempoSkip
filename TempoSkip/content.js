@@ -931,7 +931,7 @@
           e.stopImmediatePropagation();
           suppressedKeys.add(e.key);
 
-          const step = Math.max(0.05, Number(settings.speedStep) || 0.25);
+          const step = Math.max(0.01, Number(settings.speedStep) || 0.25);
           let nextSpeed = Number(settings.playbackSpeed) || 1.0;
           if (e.key === "[") {
             nextSpeed = clampSpeed(nextSpeed - step);
