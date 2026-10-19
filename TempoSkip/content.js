@@ -977,7 +977,11 @@
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area === "local") {
       if (changes.siteProfiles) siteProfiles = changes.siteProfiles.newValue || {};
-      if (changes.skipRules) skipRules = changes.skipRules.newValue || {};
+      if (changes.skipRules) {
+        skipRules = changes.skipRules.newValue || {};
+        skipState = new WeakMap(); // any rule change (toggle / forget / learn) starts auto-click fresh
+        lastAutoSkipAt = 0;
+      }
       return;
     }
     if (area !== "sync") return;
@@ -1040,8 +1044,7 @@
   const AUTOSKIP_COOLDOWN_MS = 2500;     // at most one auto-click per window
   const AUTOSKIP_MAX_ATTEMPTS = 2;       // retry once if the button is still there afterwards
   let skipRules = {};                    // { [host]: { [key]: { label, enabled, seen, lastSeen } } }
-  const skipFirstSeen = new WeakMap();
-  const skipAttempts = new WeakMap();    // element -> { n, last }
+  let skipState = new WeakMap();         // element -> { label, first, n, last }
   let pendingLearn = new Map();
   let learnTimer = null;
   let lastAutoSkipAt = 0;
@@ -1141,6 +1144,7 @@
 
   // LEARNING: only from the user's own interaction. A real (trusted) click on any "Skip ..." button
   // adds it to this site's list and flashes a hint. No page scanning.
+  const lastLearnAt = {};
   function onUserInteract(e) {
     if (!e.isTrusted || !HOST_KEY) return;
     const t = e.target;
@@ -1150,6 +1154,9 @@
     const label = skipPrimaryLabel(el);
     if (!label || !isSkipLabel(label)) return;
     const key = skipKey(label);
+    const nowMs = Date.now();
+    if (lastLearnAt[key] && nowMs - lastLearnAt[key] < 1000) return; // pointerdown + click of one press
+    lastLearnAt[key] = nowMs;
     const host = skipRules[HOST_KEY] || {};
     const isNew = !host[key];
     learnSkipButton(key, label);
@@ -1157,6 +1164,7 @@
       showHudToast("\u23ED \u201C" + label.slice(0, 24) + "\u201D saved \u2014 toggle Auto-click for it in TempoSkip settings", el.closest("video") || playingMedia() || [...trackedMedia][0]);
     }
   }
+  window.addEventListener("pointerdown", onUserInteract, true);
   window.addEventListener("click", onUserInteract, true);
   window.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") onUserInteract(e); }, true);
 
@@ -1179,19 +1187,20 @@
     for (const el of cands) {
       const label = skipPrimaryLabel(el);
       if (!label || !isSkipLabel(label)) continue;
+      // Bookkeeping first, for ALL skip buttons (enabled or not): a hidden button always starts fresh.
+      if (!isSkipAvailable(el)) { skipState.delete(el); continue; }
       const rule = rules[skipKey(label)];
       if (!rule || !rule.enabled) continue;
-      if (!isSkipAvailable(el)) { skipFirstSeen.delete(el); skipAttempts.delete(el); continue; } // hidden again => next appearance is a fresh chance
       if (el.disabled || el.getAttribute("aria-disabled") === "true") continue; // e.g. "Skip in 5" countdown
-      if (!skipFirstSeen.has(el)) { skipFirstSeen.set(el, now); continue; }
-      if (now - skipFirstSeen.get(el) < AUTOSKIP_MIN_VISIBLE_MS) continue;
+      let st = skipState.get(el);
+      if (!st || st.label !== label) { st = { label, first: now, n: 0, last: 0 }; skipState.set(el, st); continue; }
+      if (st.n && now - st.last > 8000) st.n = 0; // stale attempts expire (the player reuses one element)
+      if (now - st.first < AUTOSKIP_MIN_VISIBLE_MS) continue;
       if (now - lastAutoSkipAt < AUTOSKIP_COOLDOWN_MS) continue;
-      let at = skipAttempts.get(el) || { n: 0, last: 0 };
-      if (at.n && now - at.last > 8000) at = { n: 0, last: 0 }; // stale attempts expire (player reuses one element)
-      if (at.n >= AUTOSKIP_MAX_ATTEMPTS || (at.n > 0 && now - at.last < 2500)) continue;
-      skipAttempts.set(el, { n: at.n + 1, last: now });
+      if (st.n >= AUTOSKIP_MAX_ATTEMPTS || (st.n > 0 && now - st.last < 2500)) continue;
+      st.n++; st.last = now;
       lastAutoSkipAt = now;
-      dbg("auto-skip click:", JSON.stringify(label));
+      dbg("auto-skip click:", JSON.stringify(label), "attempt", st.n);
       try { el.click(); } catch (_) {}
       showHudToast("\u23ED " + label.slice(0, 32), media);
       return;

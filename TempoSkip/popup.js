@@ -427,7 +427,8 @@ document.getElementById("copyDiagBtn").addEventListener("click", async () => {
       .filter((r) => r && r.result && !(r.result.note && /no <video>/.test(r.result.note)))
       .map((r) => ({ frameId: r.frameId, ...r.result }));
     const learned = await new Promise((res) => chrome.storage.local.get("siteProfiles", (r) => res((r && r.siteProfiles) || {})));
-    const text = JSON.stringify({ version: chrome.runtime.getManifest().version, tab: tab.url, learnedProfiles: learned, frames: useful }, null, 2);
+    const skipRulesAll = await new Promise((res) => chrome.storage.local.get("skipRules", (r) => res((r && r.skipRules) || {})));
+    const text = JSON.stringify({ version: chrome.runtime.getManifest().version, tab: tab.url, learnedProfiles: learned, skipRules: skipRulesAll, frames: useful }, null, 2);
     await navigator.clipboard.writeText(text);
     status.textContent = useful.length ? "Copied – paste it into the chat." : "Copied (no video found in this tab).";
   } catch (e) {
