@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "TempoSkip: Custom Video Speed & Arrow Key Skip Controller",
-  "version": "1.6.6",
-  "description": "Override any web video or audio player with custom playback speeds (0.07x\u201316x) and precision Left/Right arrow skip durations.",
+  "version": "1.7.0",
+  "description": "Custom playback speeds (0.07x–16x), hold Space or mouse for a temporary speed, and precision Left/Right arrow skip durations.",
   "permissions": [
     "storage",
     "activeTab",

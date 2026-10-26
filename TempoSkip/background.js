@@ -14,6 +14,11 @@ const DEFAULT_SETTINGS = {
   enableSpeedHotkeys: true,   // '[' slower, ']' faster, '\\' reset speed
   speedStep: 0.25,            // Step size for '[' and ']' hotkeys
   showHud: true,              // Show sleek on-video HUD toast when speed/skip triggers
+  holdSpeedEnabled: true,     // Temporary speed while Space / left mouse is held
+  holdSpeed: 2.0,             // Speed used while held
+  holdSpace: true,            // Hold Spacebar (quick tap still plays/pauses)
+  holdMouse: true,            // Hold left mouse button on the video (quick click unchanged)
+  holdDelayMs: 300,           // Press longer than this = hold
   disabledHosts: [],          // Array of hostnames where overrides are paused
   autoSkipSites: {}           // { [hostname]: { intro, credits } } auto-click the player's Skip button (opt-in)
 };

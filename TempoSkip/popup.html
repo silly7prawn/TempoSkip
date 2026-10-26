@@ -143,6 +143,52 @@
       </div>
     </section>
 
+    <!-- Hold-to-speed -->
+    <section class="card">
+      <div class="card-header">
+        <span class="card-title">Hold for Temporary Speed</span>
+        <label class="mini-switch" title="Hold Space or the left mouse button for a temporary speed">
+          <input type="checkbox" id="holdSpeedToggle" checked />
+          <span class="mini-slider"></span>
+        </label>
+      </div>
+
+      <div id="holdBody">
+        <div class="step-row hold-speed-row">
+          <label for="holdSpeedInput">Speed while held</label>
+          <div class="input-with-btn step-field">
+            <input type="number" id="holdSpeedInput" min="0.07" max="16" step="0.25" value="2" />
+            <span class="sec-label">&times;</span>
+          </div>
+        </div>
+
+        <div class="preset-grid hold-preset-grid" id="holdPresets">
+          <button type="button" data-hold="0.5">0.5×</button>
+          <button type="button" data-hold="1.5">1.5×</button>
+          <button type="button" data-hold="2">2×</button>
+          <button type="button" data-hold="3">3×</button>
+          <button type="button" data-hold="4">4×</button>
+        </div>
+
+        <label class="check-row">
+          <input type="checkbox" id="holdSpaceToggle" checked />
+          <span>Hold <kbd>Space</kbd> (a quick tap still plays/pauses)</span>
+        </label>
+        <label class="check-row">
+          <input type="checkbox" id="holdMouseToggle" checked />
+          <span>Hold left mouse button on the video</span>
+        </label>
+        <div class="step-row">
+          <label for="holdDelayInput">Hold delay <span class="step-hint">(shorter = tap)</span></label>
+          <div class="input-with-btn step-field">
+            <input type="number" id="holdDelayInput" min="120" max="1500" step="50" value="300" />
+            <span class="sec-label">ms</span>
+          </div>
+        </div>
+        <div class="hold-hint">While holding, <kbd>[</kbd> / <kbd>]</kbd> adjust the hold speed.</div>
+      </div>
+    </section>
+
     <!-- Stream & Buffer Stability + Extra Controls -->
     <section class="card compact-card">
       <label class="check-row" title="Batches rapid skips into one seek and helps streaming players recover from out-of-buffer seeks">

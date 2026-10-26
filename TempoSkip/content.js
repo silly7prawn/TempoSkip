@@ -1,5 +1,6 @@
-// TempoSkip Content Script (v1.6.0)
-// Runs at document_start across all frames to override playback speeds and Left/Right arrow skip durations.
+// TempoSkip Content Script (v1.7.0)
+// Runs at document_start across all frames to override playback speeds, Left/Right arrow skip durations,
+// and hold-to-speed (hold Space / left mouse for a temporary boost speed).
 // Precision MSE seek engine: zero buffer snapping, serialized in-flight seeks, and pause-seek-play stall recovery.
 
 (() => {
@@ -26,6 +27,11 @@
     enableSpeedHotkeys: true,
     speedStep: 0.25,
     showHud: true,
+    holdSpeedEnabled: true,      // Temporary "boost" speed while a trigger is held
+    holdSpeed: 2.0,
+    holdSpace: true,             // Hold Spacebar (a quick tap still plays/pauses)
+    holdMouse: true,             // Hold left mouse button on the video (a quick click still works normally)
+    holdDelayMs: 300,            // How long a press must last before it counts as a hold
     disabledHosts: [],
     autoSkipSites: {} // legacy (v1.5): { [hostname]: { intro, credits } } - only used to migrate old ticks
   };
@@ -104,9 +110,17 @@
     return Math.min(MAX_SPEED, Math.max(MIN_SPEED, Math.round(num * 100) / 100));
   }
 
+  // Hold-to-speed state. While a hold is active, every place that enforces the speed uses the hold speed.
+  let holdActive = false;
+  function effectiveSpeed() {
+    return holdActive ? clampSpeed(settings.holdSpeed) : settings.playbackSpeed;
+  }
+
   // --- HUD Toast inside a closed Shadow Root so site CSS never interferes ---
-  function showHudToast(text, targetMedia) {
+  // opts.sticky: stay visible until hideHudToast() (used while a hold-to-speed is active).
+  function showHudToast(text, targetMedia, opts) {
     if (!settings.showHud || !document.body) return;
+    const sticky = Boolean(opts && opts.sticky);
 
     if (!hudHost) {
       hudHost = document.createElement("div");
@@ -170,12 +184,17 @@
     hudHost.style.transform = "translateY(0)";
 
     if (hudTimer) clearTimeout(hudTimer);
-    hudTimer = setTimeout(() => {
-      if (hudHost) {
-        hudHost.style.opacity = "0";
-        hudHost.style.transform = "translateY(-4px)";
-      }
-    }, 1150);
+    hudTimer = null;
+    if (!sticky) hudTimer = setTimeout(hideHudToast, 1150);
+  }
+
+  function hideHudToast() {
+    if (hudTimer) clearTimeout(hudTimer);
+    hudTimer = null;
+    if (hudHost) {
+      hudHost.style.opacity = "0";
+      hudHost.style.transform = "translateY(-4px)";
+    }
   }
 
   // --- Media Speed Application ---
@@ -221,7 +240,7 @@
     const enforceCurrentSpeed = () => {
       lastActiveMedia = media;
       if (!isSiteEnabled()) return;
-      applySpeedToMedia(media, settings.playbackSpeed);
+      applySpeedToMedia(media, effectiveSpeed());
     };
 
     media.addEventListener("play", enforceCurrentSpeed, true);
@@ -235,8 +254,9 @@
         if (internalRateUpdate || !isSiteEnabled()) return;
         const st = getSeekState(media);
         if (st.suspendRateEnforcement) return;
-        const target = clampSpeed(settings.playbackSpeed);
-        if (settings.forceSpeed && Math.abs(media.playbackRate - target) > 0.005) {
+        const target = clampSpeed(effectiveSpeed());
+        // During a hold the boost speed is always enforced, even with "Lock speed" off.
+        if ((settings.forceSpeed || holdActive) && Math.abs(media.playbackRate - target) > 0.005) {
           applySpeedToMedia(media, target);
         }
       },
@@ -244,7 +264,7 @@
     );
 
     if (isSiteEnabled()) {
-      applySpeedToMedia(media, settings.playbackSpeed);
+      applySpeedToMedia(media, effectiveSpeed());
     }
   }
 
@@ -571,7 +591,7 @@
       st.cycleActive = false;
       st.suspendRateEnforcement = false;
       if (isSiteEnabled()) {
-        applySpeedToMedia(media, settings.playbackSpeed);
+        applySpeedToMedia(media, effectiveSpeed());
       }
       return;
     }
@@ -598,7 +618,7 @@
       st.suspendRateEnforcement = false;
       st.pausedByUs = false;
       if (isSiteEnabled()) {
-        applySpeedToMedia(media, settings.playbackSpeed);
+        applySpeedToMedia(media, effectiveSpeed());
       }
     };
 
@@ -888,18 +908,293 @@
     executePrecisionSeek(media, targetTime);
   }
 
+  // --- Hold-to-speed (hold Spacebar / hold left mouse on the video) ---
+  // A press shorter than holdDelayMs behaves exactly as before (tap Space = play/pause, click = the
+  // player's own click). A longer press switches every tracked media element to settings.holdSpeed
+  // until release, then restores the normal speed. Only engages while the video is playing.
+  const HOLD_MOVE_CANCEL_PX = 10;
+  const INTERACTIVE_SEL =
+    'button, a[href], summary, select, input, textarea, [contenteditable=""], [contenteditable="true"],' +
+    ' [role="button"], [role="link"], [role="menuitem"], [role="tab"], [role="slider"], [role="checkbox"],' +
+    ' [role="switch"], [role="progressbar"], [role="menu"], [role="dialog"]';
+
+  let holdSource = null;           // "space" | "mouse" while a press is pending or active
+  let holdTimer = null;
+  let holdMedia = null;
+  let holdWasPlaying = false;
+  let spaceDownTarget = null;
+  let mouseDownAt = null;          // { x, y }
+  let suppressMouseRelease = false;
+  let suppressMouseTimer = null;
+  let replayingSpace = false;      // true while we re-dispatch a tapped Space to the page
+
+  const isSpaceKey = (e) => e.key === " " || e.code === "Space";
+  const holdDelay = () => Math.min(1500, Math.max(120, Number(settings.holdDelayMs) || 300));
+  const holdAllowed = () => isSiteEnabled() && Boolean(settings.holdSpeedEnabled);
+
+  function swallow(e) {
+    e.preventDefault();
+    e.stopPropagation();
+    e.stopImmediatePropagation();
+  }
+
+  function deepActiveElement() {
+    let a = document.activeElement;
+    while (a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement;
+    return a;
+  }
+
+  // node contains media, crossing shadow-root boundaries
+  function composedContains(node, media) {
+    for (let x = media; x; x = x.parentNode || x.host) if (x === node) return true;
+    return false;
+  }
+
+  function visibleArea(r) {
+    const w = Math.max(0, Math.min(r.right, window.innerWidth) - Math.max(r.left, 0));
+    const h = Math.max(0, Math.min(r.bottom, window.innerHeight) - Math.max(r.top, 0));
+    return w * h;
+  }
+
+  // Space only boosts a video that is the obvious focus of the page (so it doesn't hijack page scrolling).
+  function mediaIsProminent(media) {
+    if (document.fullscreenElement || document.webkitFullscreenElement) return true;
+    return visibleArea(media.getBoundingClientRect()) >= 0.2 * window.innerWidth * window.innerHeight;
+  }
+
+  function focusIsInPlayer(el, media) {
+    if (!el || el === media || composedContains(el, media)) return true;
+    const r = el.getBoundingClientRect();
+    const m = media.getBoundingClientRect();
+    const cx = r.left + r.width / 2;
+    const cy = r.top + r.height / 2;
+    return cx >= m.left && cx <= m.right && cy >= m.top && cy <= m.bottom;
+  }
+
+  function beginHold() {
+    holdTimer = null;
+    if (!holdSource || holdActive || !holdAllowed()) return;
+    if (!holdMedia || !holdMedia.isConnected) holdMedia = getBestMediaElement();
+    if (!holdMedia) return;
+    holdActive = true;
+    // Players that toggle play on mousedown have already paused by now: undo that, the user meant "go faster".
+    if (holdWasPlaying && holdMedia.paused && !holdMedia.ended) {
+      try { holdMedia.play().catch(() => {}); } catch (_) {}
+    }
+    const spd = clampSpeed(settings.holdSpeed);
+    applySpeedToAllMedia(spd, false);
+    showHudToast(`⏩ ${formatNumber(spd)}x  ·  hold`, holdMedia, { sticky: true });
+    dbg("hold start", holdSource, spd);
+  }
+
+  // Returns true if a hold was actually active (i.e. this was a hold, not a tap).
+  function endHold(showToast = true) {
+    if (holdTimer) { clearTimeout(holdTimer); holdTimer = null; }
+    const wasActive = holdActive;
+    const media = holdMedia;
+    holdActive = false;
+    holdSource = null;
+    holdMedia = null;
+    mouseDownAt = null;
+    spaceDownTarget = null;
+    if (!wasActive) return false;
+    dbg("hold end");
+    applySpeedToAllMedia(settings.playbackSpeed, false); // no-op if the site was just disabled
+    hideHudToast();
+    if (showToast && isSiteEnabled()) {
+      showHudToast(`▶ ${formatNumber(clampSpeed(settings.playbackSpeed))}x`, media);
+    }
+    return true;
+  }
+
+  // --- Spacebar ---
+  function handleSpaceDown(e, media) {
+    if (holdSource === "space") { swallow(e); return true; } // auto-repeat while held
+    if (holdSource || e.repeat || e.shiftKey || !holdAllowed() || !settings.holdSpace) return false;
+    if (media.paused || media.ended) return false; // paused: let Space start playback as usual
+    const focused = deepActiveElement();
+    const nothingFocused = !focused || focused === document.body || focused === document.documentElement;
+    if (nothingFocused ? !mediaIsProminent(media) : !focusIsInPlayer(focused, media)) return false;
+
+    swallow(e);
+    holdSource = "space";
+    holdMedia = media;
+    holdWasPlaying = true;
+    spaceDownTarget = e.composedPath ? e.composedPath()[0] : e.target;
+    holdTimer = setTimeout(beginHold, holdDelay());
+    return true;
+  }
+
+  // A quick tap: hand Space back to the page so its own play/pause runs. If the player ignores
+  // synthetic keys, toggle the element directly.
+  function replaySpaceTap(target, media) {
+    if (!media) return;
+    const before = media.paused;
+    const t = target && target.isConnected ? target : deepActiveElement() || document.body;
+    const mk = (type) =>
+      new KeyboardEvent(type, {
+        key: " ", code: "Space", keyCode: 32, which: 32, charCode: type === "keypress" ? 32 : 0,
+        bubbles: true, cancelable: true, composed: true, view: window
+      });
+    // Native Space on a focused <button>/<summary> clicks it; synthetic events have no default action,
+    // so reproduce that ourselves (unless the page's key handler cancelled it).
+    const nativeBtn = t.closest && t.closest('button, summary, input[type="button"], input[type="submit"], input[type="checkbox"], input[type="radio"]');
+    let cancelled = false;
+    replayingSpace = true;
+    try {
+      cancelled = !t.dispatchEvent(mk("keydown"));
+      t.dispatchEvent(mk("keypress"));
+      t.dispatchEvent(mk("keyup"));
+    } catch (_) {
+    } finally {
+      replayingSpace = false;
+    }
+    if (nativeBtn) {
+      if (!cancelled) { try { nativeBtn.click(); } catch (_) {} }
+      return;
+    }
+    setTimeout(() => {
+      if (!media.isConnected || media.paused !== before) return;
+      dbg("space replay ignored by player -> toggling element directly");
+      try { before ? media.play().catch(() => {}) : media.pause(); } catch (_) {}
+    }, 250);
+  }
+
+  window.addEventListener(
+    "keyup",
+    (e) => {
+      if (replayingSpace || holdSource !== "space" || !isSpaceKey(e)) return;
+      swallow(e);
+      const target = spaceDownTarget;
+      const media = holdMedia;
+      if (!endHold(true)) replaySpaceTap(target, media);
+    },
+    { capture: true, passive: false }
+  );
+  window.addEventListener(
+    "keypress",
+    (e) => { if (!replayingSpace && holdSource === "space" && isSpaceKey(e)) swallow(e); },
+    { capture: true, passive: false }
+  );
+
+  // --- Left mouse button ---
+  function mediaUnderPoint(x, y) {
+    let best = null;
+    let bestArea = 0;
+    for (const m of trackedMedia) {
+      if (!m.isConnected || m.tagName !== "VIDEO") continue;
+      const r = m.getBoundingClientRect();
+      if (r.width < 120 || r.height < 80) continue;
+      if (x < r.left || x > r.right || y < r.top || y > r.bottom) continue;
+      const a = r.width * r.height;
+      if (a > bestArea) { bestArea = a; best = m; }
+    }
+    return best;
+  }
+
+  // The press must land on the video or the player's overlay, never on a control (buttons, seek bar,
+  // menus), and not in the bottom strip where control bars live.
+  function pressIsOnPlayerSurface(e, media) {
+    const r = media.getBoundingClientRect();
+    const band = Math.min(64, r.height * 0.2);
+    if (e.clientY > r.bottom - band) return false;
+    const path = e.composedPath ? e.composedPath() : [e.target];
+    const mArea = r.width * r.height;
+    for (const n of path) {
+      if (n === media) return true;
+      if (!n || n.nodeType !== 1) continue;
+      try { if (n.matches(INTERACTIVE_SEL)) return false; } catch (_) {}
+      if (composedContains(n, media)) {
+        // First ancestor shared with the video: must be the player itself, not a page-level wrapper
+        // (rules out e.g. a sticky site header that happens to overlap the video).
+        const nr = n.getBoundingClientRect();
+        return nr.width * nr.height <= mArea * 2.2 + 1;
+      }
+    }
+    return false;
+  }
+
+  function clearMouseSuppression() {
+    suppressMouseRelease = false;
+    if (suppressMouseTimer) { clearTimeout(suppressMouseTimer); suppressMouseTimer = null; }
+  }
+
+  window.addEventListener(
+    "pointerdown",
+    (e) => {
+      if (!e.isTrusted || e.button !== 0 || holdSource) return;
+      if (e.ctrlKey || e.shiftKey || e.altKey || e.metaKey) return;
+      if (!holdAllowed() || !settings.holdMouse) return;
+      const media = mediaUnderPoint(e.clientX, e.clientY);
+      if (!media || media.paused || media.ended) return;
+      if (!pressIsOnPlayerSurface(e, media)) return;
+      clearMouseSuppression();
+      holdSource = "mouse";
+      holdMedia = media;
+      holdWasPlaying = true;
+      mouseDownAt = { x: e.clientX, y: e.clientY };
+      holdTimer = setTimeout(beginHold, holdDelay());
+      // NOTE: pointerdown itself is NOT swallowed: a short click must reach the player untouched.
+    },
+    true
+  );
+
+  window.addEventListener(
+    "pointermove",
+    (e) => {
+      if (holdSource !== "mouse" || holdActive || !mouseDownAt) return;
+      if (Math.hypot(e.clientX - mouseDownAt.x, e.clientY - mouseDownAt.y) > HOLD_MOVE_CANCEL_PX) {
+        endHold(false); // a drag, not a hold
+      }
+    },
+    true
+  );
+
+  function onMouseRelease(e) {
+    if (holdSource === "mouse") {
+      if (e.type === "pointercancel") { endHold(true); return; }
+      if (e.button !== 0) return;
+      if (endHold(true)) {
+        // This was a hold: hide the release from the player so it doesn't treat it as a click (play/pause).
+        swallow(e);
+        suppressMouseRelease = true;
+        if (suppressMouseTimer) clearTimeout(suppressMouseTimer);
+        suppressMouseTimer = setTimeout(clearMouseSuppression, 500);
+      }
+      return;
+    }
+    if (suppressMouseRelease && (e.type === "mouseup" || e.type === "click" || e.type === "pointerup")) {
+      swallow(e);
+      if (e.type === "click") clearMouseSuppression();
+    }
+  }
+  window.addEventListener("pointerup", onMouseRelease, { capture: true, passive: false });
+  window.addEventListener("pointercancel", onMouseRelease, true);
+  window.addEventListener("mouseup", onMouseRelease, { capture: true, passive: false });
+  window.addEventListener("click", onMouseRelease, { capture: true, passive: false });
+  window.addEventListener("dblclick", (e) => { if (suppressMouseRelease) swallow(e); }, { capture: true, passive: false });
+  window.addEventListener("contextmenu", (e) => { if (holdActive) swallow(e); }, { capture: true, passive: false });
+
+  // Never leave a video stuck at the boost speed.
+  window.addEventListener("blur", () => { if (holdSource) endHold(true); });
+  document.addEventListener("visibilitychange", () => { if (document.hidden && holdSource) endHold(false); });
+
   // --- Capture-Phase Keyboard Interception ---
   const suppressedKeys = new Set();
 
   window.addEventListener(
     "keydown",
     (e) => {
+      if (replayingSpace) return; // our own re-dispatched Space tap: let the page have it
       if (!isSiteEnabled()) return;
       if (e.ctrlKey || e.altKey || e.metaKey) return;
       if (isEditableTarget(e.target) || isEditableTarget(document.activeElement)) return;
 
       const media = getBestMediaElement();
       if (!media) return;
+
+      // 0. Hold Spacebar for temporary speed (a quick tap still plays/pauses)
+      if (isSpaceKey(e) && handleSpaceDown(e, media)) return;
 
       // 1. Left & Right Arrow Key Custom Skip Override
       if (settings.overrideArrowKeys && (e.key === "ArrowLeft" || e.key === "ArrowRight")) {
@@ -932,6 +1227,18 @@
           suppressedKeys.add(e.key);
 
           const step = Math.max(0.01, Number(settings.speedStep) || 0.25);
+
+          // While holding for boost speed, '[' / ']' tune the boost speed itself (and remember it).
+          if (holdActive && (e.key === "[" || e.key === "]")) {
+            const cur = clampSpeed(settings.holdSpeed);
+            const nextHold = clampSpeed(e.key === "[" ? cur - step : cur + step);
+            settings.holdSpeed = nextHold;
+            applySpeedToAllMedia(nextHold, false);
+            showHudToast(`⏩ ${formatNumber(nextHold)}x  ·  hold`, holdMedia || media, { sticky: true });
+            chrome.storage.sync.set({ holdSpeed: nextHold });
+            return;
+          }
+
           let nextSpeed = Number(settings.playbackSpeed) || 1.0;
           if (e.key === "[") {
             nextSpeed = clampSpeed(nextSpeed - step);
@@ -942,7 +1249,7 @@
           }
 
           settings.playbackSpeed = nextSpeed;
-          applySpeedToAllMedia(nextSpeed, true);
+          applySpeedToAllMedia(effectiveSpeed(), !holdActive);
           chrome.storage.sync.set({ playbackSpeed: nextSpeed });
         }
       }
@@ -969,7 +1276,7 @@
     if (stored) {
       settings = { ...settings, ...stored };
       if (isSiteEnabled()) {
-        applySpeedToAllMedia(settings.playbackSpeed, false);
+        applySpeedToAllMedia(effectiveSpeed(), false);
       }
     }
   });
@@ -992,9 +1299,15 @@
         speedChanged = true;
       }
     }
+    // Turning the extension / site / feature off mid-hold ends the hold.
+    if (holdActive && (!isSiteEnabled() || !settings.holdSpeedEnabled)) {
+      endHold(false);
+    } else if (holdActive && changes.holdSpeed) {
+      applySpeedToAllMedia(effectiveSpeed(), false);
+    }
     if (speedChanged) {
       if (isSiteEnabled()) {
-        applySpeedToAllMedia(settings.playbackSpeed, true);
+        applySpeedToAllMedia(effectiveSpeed(), !holdActive);
       } else {
         trackedMedia.forEach((m) => {
           try {

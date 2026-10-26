@@ -1,4 +1,4 @@
-// TempoSkip Popup Controller (v1.2.0)
+// TempoSkip Popup Controller (v1.3.0)
 
 const DEFAULT_SETTINGS = {
   enabled: true,
@@ -14,6 +14,11 @@ const DEFAULT_SETTINGS = {
   enableSpeedHotkeys: true,
   speedStep: 0.25,
   showHud: true,
+  holdSpeedEnabled: true,
+  holdSpeed: 2.0,
+  holdSpace: true,
+  holdMouse: true,
+  holdDelayMs: 300,
   disabledHosts: [],
   autoSkipSites: {}
 };
@@ -41,6 +46,13 @@ const els = {
   speedHotkeysToggle: document.getElementById("speedHotkeysToggle"),
   speedStepInput: document.getElementById("speedStepInput"),
   showHudToggle: document.getElementById("showHudToggle"),
+  holdSpeedToggle: document.getElementById("holdSpeedToggle"),
+  holdBody: document.getElementById("holdBody"),
+  holdSpeedInput: document.getElementById("holdSpeedInput"),
+  holdPresets: document.getElementById("holdPresets"),
+  holdSpaceToggle: document.getElementById("holdSpaceToggle"),
+  holdMouseToggle: document.getElementById("holdMouseToggle"),
+  holdDelayInput: document.getElementById("holdDelayInput"),
   resetDefaultsBtn: document.getElementById("resetDefaultsBtn"),
   autoSkipHost: document.getElementById("autoSkipHost"),
   skipRulesList: document.getElementById("skipRulesList")
@@ -62,6 +74,12 @@ function clampSeconds(val, fallback = 5) {
   return Math.min(3600, Math.max(0.1, Math.round(num * 100) / 100));
 }
 
+function clampHoldDelay(val) {
+  const num = Number(val);
+  if (Number.isNaN(num)) return 300;
+  return Math.min(1500, Math.max(120, Math.round(num)));
+}
+
 function highlightActivePresets() {
   const speed = Number(currentSettings.playbackSpeed);
   els.speedPresets.querySelectorAll("button").forEach((btn) => {
@@ -74,6 +92,11 @@ function highlightActivePresets() {
   els.skipPresets.querySelectorAll("button").forEach((btn) => {
     const s = Number(btn.dataset.skip);
     btn.classList.toggle("active", Math.abs(rew - s) < 0.005 && Math.abs(fwd - s) < 0.005);
+  });
+
+  const hold = Number(currentSettings.holdSpeed);
+  els.holdPresets.querySelectorAll("button").forEach((btn) => {
+    btn.classList.toggle("active", Math.abs(Number(btn.dataset.hold) - hold) < 0.005);
   });
 }
 
@@ -112,6 +135,18 @@ function renderUI() {
   els.speedStepInput.value = currentSettings.speedStep;
   els.speedStepInput.disabled = !currentSettings.enableSpeedHotkeys;
   els.showHudToggle.checked = Boolean(currentSettings.showHud);
+
+  const holdOn = Boolean(currentSettings.holdSpeedEnabled);
+  els.holdSpeedToggle.checked = holdOn;
+  els.holdBody.classList.toggle("off", !holdOn);
+  els.holdSpeedInput.value = clampSpeed(currentSettings.holdSpeed);
+  els.holdSpaceToggle.checked = Boolean(currentSettings.holdSpace);
+  els.holdMouseToggle.checked = Boolean(currentSettings.holdMouse);
+  els.holdDelayInput.value = clampHoldDelay(currentSettings.holdDelayMs);
+  [els.holdSpeedInput, els.holdSpaceToggle, els.holdMouseToggle, els.holdDelayInput].forEach((el) => {
+    el.disabled = !holdOn;
+  });
+  els.holdPresets.querySelectorAll("button").forEach((b) => (b.disabled = !holdOn));
 
   highlightActivePresets();
   renderSiteStatus();
@@ -251,6 +286,32 @@ els.speedHotkeysToggle.addEventListener("change", () => {
 
 els.showHudToggle.addEventListener("change", () => {
   savePatch({ showHud: els.showHudToggle.checked });
+});
+
+els.holdSpeedToggle.addEventListener("change", () => {
+  savePatch({ holdSpeedEnabled: els.holdSpeedToggle.checked });
+});
+
+els.holdSpeedInput.addEventListener("change", () => {
+  savePatch({ holdSpeed: clampSpeed(els.holdSpeedInput.value) });
+});
+
+els.holdPresets.addEventListener("click", (e) => {
+  const btn = e.target.closest("button[data-hold]");
+  if (!btn) return;
+  savePatch({ holdSpeed: clampSpeed(btn.dataset.hold) });
+});
+
+els.holdSpaceToggle.addEventListener("change", () => {
+  savePatch({ holdSpace: els.holdSpaceToggle.checked });
+});
+
+els.holdMouseToggle.addEventListener("change", () => {
+  savePatch({ holdMouse: els.holdMouseToggle.checked });
+});
+
+els.holdDelayInput.addEventListener("change", () => {
+  savePatch({ holdDelayMs: clampHoldDelay(els.holdDelayInput.value) });
 });
 
 els.resetDefaultsBtn.addEventListener("click", async () => {

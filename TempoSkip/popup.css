@@ -430,3 +430,9 @@ kbd {
 .step-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 11.5px; color: #cbd5e1; padding-left: 21px; }
 .step-hint { color: #64748b; }
 .step-field { width: 86px; flex-shrink: 0; }
+
+/* Hold-to-speed card */
+#holdBody { display: flex; flex-direction: column; gap: 8px; transition: opacity 0.15s ease; }
+#holdBody.off { opacity: 0.45; }
+.hold-speed-row { padding-left: 0; }
+.hold-hint { font-size: 10.5px; color: #64748b; }
